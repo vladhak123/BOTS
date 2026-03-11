@@ -22,8 +22,8 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 # ─────────────────────────────────────────────
 # 🔑  ENV VARS
 # ─────────────────────────────────────────────
-TG_TOKEN         = os.environ.get("TG_TOKEN", "YOUR_TOKEN_HERE")
-DS_KEY           = os.environ.get("DS_KEY", "YOUR_DEEPSEEK_KEY_HERE")
+TG_TOKEN   = os.environ.get("TG_TOKEN", "8647895785:AAESQ2oSwnTNCXW9y9RjgsWvMZjyS_mX3iA")
+DS_KEY = os.environ.get("DS_KEY", "sk-7f2b9cc52ff3405baab9824544b129b9"),
 MEMORY_FILE      = os.environ.get("MEMORY_FILE", "bot_memory.json")
 STARTING_BALANCE = 1000.0
 
