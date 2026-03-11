@@ -13,7 +13,7 @@ from datetime import datetime, timezone, time as dtime
 from pathlib import Path
 
 import requests
-from openai import OpenAI
+
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -28,8 +28,17 @@ STARTING_BALANCE = 1000.0
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
 
-def get_deepseek():
-    return OpenAI(api_key=os.environ.get("DS_KEY", ""), base_url="https://api.deepseek.com")
+def call_deepseek(prompt: str) -> str:
+    r = requests.post(
+        "https://api.deepseek.com/chat/completions",
+        headers={"Authorization": f"Bearer {os.environ.get('DS_KEY', '')}",
+                 "Content-Type": "application/json"},
+        json={"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}],
+              "max_tokens": 400, "temperature": 0.3},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"].strip()
 
 
 # ══════════════════════════════════════════════
@@ -118,13 +127,7 @@ Reply ONLY with valid JSON, no markdown, no explanation outside JSON:
 }}"""
 
     try:
-        resp = get_deepseek().chat.completions.create(
-            model="deepseek-chat",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=400,
-            temperature=0.3,
-        )
-        text = resp.choices[0].message.content.strip()
+        text = call_deepseek(prompt)
         if "```" in text:
             text = text.split("```")[1]
             if text.startswith("json"):
