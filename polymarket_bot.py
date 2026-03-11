@@ -442,14 +442,14 @@ async def cmd_autostart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # run every 15 minutes
     ctx.job_queue.run_repeating(
         _daily_job,
-        interval=900,
+        interval=180,
         first=30,
         chat_id=chat_id,
         name=str(chat_id),
     )
     await update.message.reply_text(
         "⏰ *Авторежим увімкнено!*\n\n"
-        "Кожні *15 хвилин* бот буде:\n"
+        "Кожні *3 хвилини* бот буде:\n"
         "1. Сканувати ринки Polymarket\n"
         "2. Якщо є хороша можливість — ставить\n"
         "3. Якщо немає — мовчить і чекає\n"
