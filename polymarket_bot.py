@@ -20,8 +20,8 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 # ─────────────────────────────────────────────
 # 🔑  ENV VARS — встав на Railway
 # ─────────────────────────────────────────────
-TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "8647895785:AAESQ2oSwnTNCXW9y9RjgsWvMZjyS_mX3iA")
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "sk-7f2b9cc52ff3405baab9824544b129b9")
+TG_TOKEN   = os.environ.get("TG_TOKEN", "8647895785:AAESQ2oSwnTNCXW9y9RjgsWvMZjyS_mX3iA")
+DS_KEY = os.environ.get("DS_KEY", "sk-7f2b9cc52ff3405baab9824544b129b9")
 MEMORY_FILE      = os.environ.get("MEMORY_FILE", "bot_memory.json")
 STARTING_BALANCE = 1000.0
 
@@ -29,7 +29,7 @@ logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=lo
 log = logging.getLogger(__name__)
 
 def get_deepseek():
-    return OpenAI(api_key=os.environ.get("DEEPSEEK_API_KEY", ""), base_url="https://api.deepseek.com")
+    return OpenAI(api_key=os.environ.get("DS_KEY", ""), base_url="https://api.deepseek.com")
 
 
 # ══════════════════════════════════════════════
@@ -381,7 +381,7 @@ async def cmd_autostart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════
 
 def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = Application.builder().token(TG_TOKEN).build()
     app.add_handler(CommandHandler("start",     cmd_start))
     app.add_handler(CommandHandler("analyse",   cmd_analyse))
     app.add_handler(CommandHandler("bets",      cmd_bets))
@@ -391,5 +391,5 @@ def main():
     log.info("🚀 Bot started!")
     app.run_polling()
 
-if"__main__":
+if __name__ == "__main__":
     main()
