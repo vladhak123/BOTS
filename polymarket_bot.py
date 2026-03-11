@@ -66,7 +66,8 @@ def save_memory(data: dict):
 # 📡  POLYMARKET API
 # ══════════════════════════════════════════════
 
-def fetch_markets(limit: int = 15) -> list[dict]:
+def fetch_markets(limit: int = 100) -> list[dict]:
+    import random
     try:
         r = requests.get(
             "https://gamma-api.polymarket.com/markets",
@@ -76,7 +77,24 @@ def fetch_markets(limit: int = 15) -> list[dict]:
         )
         r.raise_for_status()
         markets = r.json()
-        return [m for m in markets if m.get("question") and m.get("outcomePrices")][:10]
+        valid = [m for m in markets if m.get("question") and m.get("outcomePrices")]
+
+        # LOTTERY STRATEGY: find markets with at least one outcome priced <8%
+        lottery = []
+        for m in valid:
+            prices = parse_prices(m)
+            min_price = min(prices.values()) if prices else 1.0
+            if min_price <= 0.08:  # at least one outcome < 8% = potential x12+
+                m["_min_price"] = min_price
+                lottery.append(m)
+
+        # sort by min_price ascending (cheapest = biggest multiplier)
+        lottery.sort(key=lambda x: x.get("_min_price", 1))
+
+        # take top-30 cheapest, shuffle to avoid always same market
+        top = lottery[:30]
+        random.shuffle(top)
+        return top[:20] if top else valid[:20]
     except Exception as e:
         log.error("Polymarket error: %s", e)
         return []
@@ -103,7 +121,12 @@ def parse_prices(market: dict) -> dict:
 # 🤖  DEEPSEEK ANALYSIS
 # ══════════════════════════════════════════════
 
-def ai_analyse(markets: list[dict]) -> dict | None:
+def ai_analyse(markets: list[dict], skip_ids: set = None) -> dict | None:
+    skip_ids = skip_ids or set()
+    # filter out already-bet markets
+    markets = [m for m in markets if m.get("id") not in skip_ids]
+    if not markets:
+        return None
     summaries = []
     for m in markets:
         prices = parse_prices(m)
@@ -111,20 +134,43 @@ def ai_analyse(markets: list[dict]) -> dict | None:
         vol = m.get("volume24hr", 0)
         summaries.append(f"• [id:{m.get('id','?')}] {m['question']} | {price_str} | Vol: ${vol}")
 
-    prompt = f"""You are a sharp prediction-market analyst. Here are today's top Polymarket markets:
+    import random
+    mode = random.choices(["lottery", "value"], weights=[60, 40])[0]
+
+    if mode == "lottery":
+        strategy_desc = "LOTTERY MODE: Find ONE market where a LOW-probability outcome (<8%) is secretly more likely than crowd thinks. Look for black swans, surprise events, underdogs. Pick the CHEAP side."
+        json_fields = """{
+  "mode": "lottery",
+  "market_id": "<id>",
+  "question": "<exact question>",
+  "pick": "<YES or NO - the cheap side>",
+  "market_price": <price as decimal e.g. 0.03>,
+  "potential_multiplier": <round(1/price)>,
+  "reason": "<why this underdog has real chance>",
+  "bet_usd": 2
+}"""
+    else:
+        strategy_desc = "VALUE MODE: Find ONE market where the crowd probability is clearly WRONG based on recent news or logic. Pick whichever side (YES or NO) seems mispriced by at least 10-20%."
+        json_fields = """{
+  "mode": "value",
+  "market_id": "<id>",
+  "question": "<exact question>",
+  "pick": "<YES or NO>",
+  "market_price": <price as decimal>,
+  "true_probability": <your estimate>,
+  "potential_multiplier": <round(true_prob/market_price, 1)>,
+  "reason": "<why crowd is wrong>",
+  "bet_usd": 5
+}"""
+
+    prompt = f"""You are an elite prediction-market trader. Here are active Polymarket markets:
 
 {chr(10).join(summaries)}
 
-Find the ONE market where the crowd probability seems most wrong.
-Reply ONLY with valid JSON, no markdown, no explanation outside JSON:
-{{
-  "market_id": "<id from the list>",
-  "question": "<exact question>",
-  "pick": "<YES or NO>",
-  "confidence": <50-95>,
-  "reason": "<2-3 sentences why crowd is wrong>",
-  "bet_pct": <2-8>
-}}"""
+{strategy_desc}
+
+Reply ONLY with valid JSON, no markdown:
+{json_fields}"""
 
     try:
         text = call_deepseek(prompt)
@@ -132,7 +178,11 @@ Reply ONLY with valid JSON, no markdown, no explanation outside JSON:
             text = text.split("```")[1]
             if text.startswith("json"):
                 text = text[4:]
-        return json.loads(text.strip())
+        result = json.loads(text.strip())
+        # fallback bet_pct if not present
+        if "bet_pct" not in result:
+            result["bet_pct"] = 2
+        return result
     except Exception as e:
         log.error("DeepSeek error: %s", e)
         return None
@@ -213,9 +263,10 @@ async def cmd_analyse(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     await msg.edit_text(f"🧠 DeepSeek аналізує {len(markets)} ринків…")
-    analysis = ai_analyse(markets)
+    already_bet = {b["market_id"] for b in memory["bets"] if b["status"] == "open"}
+    analysis = ai_analyse(markets, skip_ids=already_bet)
     if not analysis:
-        await msg.edit_text("❌ DeepSeek не відповів. Спробуй ще раз.")
+        await msg.edit_text("❌ Всі ринки вже в ставках або DeepSeek не відповів.")
         return
 
     matched = next((m for m in markets if m.get("id") == analysis.get("market_id")), None)
@@ -226,8 +277,6 @@ async def cmd_analyse(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     prices  = parse_prices(matched)
     price   = prices.get(pick, prices.get("Yes", 0.5))
     bet_pct = min(analysis.get("bet_pct", 3), 8)
-
-    memory = load_memory()
     wager  = round(memory["balance"] * bet_pct / 100, 2)
     if wager < 0.01:
         await msg.edit_text("❌ Баланс занадто малий.")
@@ -346,12 +395,15 @@ async def _daily_job(ctx: ContextTypes.DEFAULT_TYPE):
     })
     save_memory(memory)
 
+    mode = analysis.get("mode", "lottery")
+    emoji = "🎰" if mode == "lottery" else "🎯"
     await ctx.bot.send_message(
         chat_id=chat_id,
         text=(
-            f"🌅 *Щоденна ставка*\n\n"
+            f"{emoji} *Авто-ставка [{mode.upper()}]*\n\n"
             f"📋 {matched['question']}\n"
-            f"📌 *{pick}* | ${wager:.2f} | {analysis.get('confidence')}%\n"
+            f"📌 *{pick}* @ {price:.1%} | x{multiplier}\n"
+            f"💰 ${wager:.2f} → якщо виграє ~${wager*multiplier:.0f}\n"
             f"💼 Баланс: ${memory['balance']:.2f}\n\n"
             f"🧠 {analysis.get('reason', '—')}"
         ),
@@ -360,21 +412,26 @@ async def _daily_job(ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_autostart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    # remove old jobs
     for job in ctx.job_queue.get_jobs_by_name(str(chat_id)):
         job.schedule_removal()
-    ctx.job_queue.run_daily(
+    # run every 1 hour
+    ctx.job_queue.run_repeating(
         _daily_job,
-        time=dtime(hour=9, minute=0),
+        interval=3600,
+        first=60,
         chat_id=chat_id,
         name=str(chat_id),
     )
     await update.message.reply_text(
         "⏰ *Авторежим увімкнено!*\n\n"
-        "Щодня о 09:00 UTC:\n"
-        "1. Перевіряю результати ставок\n"
-        "2. Аналізую нові ринки через DeepSeek\n"
-        "3. Роблю нову ставку\n"
-        "4. Звітую тут",
+        "Кожну *годину* бот буде:\n"
+        "1. Перевіряти результати ставок\n"
+        "2. Шукати лотерейні ринки (<8% ціна)\n"
+        "3. Ставити $1-5 на найкращий варіант\n"
+        "4. Звітувати тут\n\n"
+        "Стратегія: багато дрібних ставок, чекаємо x100-x1000 🎰\n"
+        "Перший запуск через 1 хвилину!",
         parse_mode="Markdown",
     )
 
@@ -396,3 +453,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
