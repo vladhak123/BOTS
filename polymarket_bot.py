@@ -68,6 +68,7 @@ def save_memory(data: dict):
 
 def fetch_markets(limit: int = 100) -> list[dict]:
     import random
+    from datetime import datetime, timezone
     try:
         r = requests.get(
             "https://gamma-api.polymarket.com/markets",
@@ -77,7 +78,22 @@ def fetch_markets(limit: int = 100) -> list[dict]:
         )
         r.raise_for_status()
         markets = r.json()
-        valid = [m for m in markets if m.get("question") and m.get("outcomePrices")]
+        now = datetime.now(timezone.utc)
+        valid = []
+        for m in markets:
+            if not m.get("question") or not m.get("outcomePrices"):
+                continue
+            # skip markets that already ended
+            end_date = m.get("endDate") or m.get("end_date") or m.get("expirationTime")
+            if end_date:
+                try:
+                    end_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+                    if end_dt < now:
+                        log.info("Skipping expired market: %s", m.get("question", "")[:50])
+                        continue
+                except Exception:
+                    pass
+            valid.append(m)
 
         # LOTTERY STRATEGY: find markets with at least one outcome priced <8%
         lottery = []
