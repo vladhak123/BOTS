@@ -198,10 +198,33 @@ def resolve_bets(memory: dict) -> list[str]:
         if bet["status"] != "open":
             continue
         market = fetch_market(bet["market_id"])
-        if not market or not market.get("resolved"):
+        if not market:
             continue
-        winner = market.get("resolvedOutcome", "")
-        if not winner:
+
+        # Polymarket uses different fields depending on market type
+        is_resolved = (
+            market.get("resolved") or
+            market.get("closed") or
+            market.get("resolutionTime") or
+            market.get("resolvedAt")
+        )
+        if not is_resolved:
+            continue
+
+        # Try multiple fields for winner
+        winner = (
+            market.get("resolvedOutcome") or
+            market.get("resolution") or
+            market.get("winner") or
+            ""
+        )
+
+        # If still no winner but market closed — mark as cancelled/refund
+        if not winner and is_resolved:
+            bet["status"] = "cancelled"
+            bet["pnl"] = 0
+            memory["balance"] += bet["wager"]  # refund
+            msgs.append(f"↩️ *Ставка повернута*\n{bet['question']}\nРинок закрився без результату — повернуто ${bet['wager']:.2f}")
             continue
 
         bet["status"] = "closed"
