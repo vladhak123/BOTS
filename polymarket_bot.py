@@ -28,7 +28,8 @@ STARTING_BALANCE = 1000.0
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
 
-deepseek = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
+def get_deepseek():
+    return OpenAI(api_key=os.environ.get("DEEPSEEK_API_KEY", ""), base_url="https://api.deepseek.com")
 
 
 # ══════════════════════════════════════════════
@@ -117,7 +118,7 @@ Reply ONLY with valid JSON, no markdown, no explanation outside JSON:
 }}"""
 
     try:
-        resp = deepseek.chat.completions.create(
+        resp = get_deepseek().chat.completions.create(
             model="deepseek-chat",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=400,
@@ -390,5 +391,5 @@ def main():
     log.info("🚀 Bot started!")
     app.run_polling()
 
-if __name__ == "__main__":
+if"__main__":
     main()
