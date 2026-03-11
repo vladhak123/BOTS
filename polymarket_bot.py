@@ -22,8 +22,8 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 # ─────────────────────────────────────────────
 # 🔑  ENV VARS
 # ─────────────────────────────────────────────
-TG_TOKEN   = os.environ.get("TG_TOKEN", "8647895785:AAESQ2oSwnTNCXW9y9RjgsWvMZjyS_mX3iA")
-DS_KEY = os.environ.get("DS_KEY", "sk-7f2b9cc52ff3405baab9824544b129b9"),
+TG_TOKEN         = os.environ.get("TG_TOKEN", "YOUR_TOKEN_HERE")
+DS_KEY           = os.environ.get("DS_KEY", "YOUR_DEEPSEEK_KEY_HERE")
 MEMORY_FILE      = os.environ.get("MEMORY_FILE", "bot_memory.json")
 STARTING_BALANCE = 1000.0
 
@@ -143,10 +143,11 @@ def fetch_markets(limit: int = 100) -> list[dict]:
             if m.get("resolved") or m.get("closed"):
                 continue
             end_dt = parse_end_date(m)
-            if end_dt:
-                hours_left = (end_dt - now).total_seconds() / 3600
-                if hours_left < 0 or hours_left > 24:
-                    continue
+            if not end_dt:
+                continue  # no end date = skip
+            hours_left = (end_dt - now).total_seconds() / 3600
+            if hours_left < 0 or hours_left > 24:
+                continue
             valid.append(m)
 
         if not valid:
@@ -305,6 +306,8 @@ IMPORTANT RULES:
 - NEVER pick markets about past dates
 - Only pick markets you have genuine insight on
 - Be honest about uncertainty
+- Write the "reason" field in RUSSIAN language (Русский язык)
+- Translate the "question" field to Russian too
 
 Reply ONLY with valid JSON, no markdown:
 {json_template}"""
