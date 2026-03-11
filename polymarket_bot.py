@@ -83,13 +83,17 @@ def fetch_markets(limit: int = 100) -> list[dict]:
         for m in markets:
             if not m.get("question") or not m.get("outcomePrices"):
                 continue
-            # skip markets that already ended
+            # skip expired or markets closing more than 1 day away
             end_date = m.get("endDate") or m.get("end_date") or m.get("expirationTime")
             if end_date:
                 try:
                     end_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+                    hours_left = (end_dt - now).total_seconds() / 3600
                     if end_dt < now:
-                        log.info("Skipping expired market: %s", m.get("question", "")[:50])
+                        log.info("Skipping expired: %s", m.get("question", "")[:50])
+                        continue
+                    if hours_left > 24:
+                        log.info("Skipping >24h market (%dh): %s", hours_left, m.get("question", "")[:40])
                         continue
                 except Exception:
                     pass
