@@ -357,25 +357,49 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def _daily_job(ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = ctx.job.chat_id
     memory = load_memory()
+
+    # resolve finished bets
     for r in resolve_bets(memory):
         await ctx.bot.send_message(chat_id=chat_id, text=r, parse_mode="Markdown")
 
     markets = fetch_markets()
     if not markets:
+        log.info("No markets found, skipping")
         return
-    analysis = ai_analyse(markets)
+
+    already_bet = {b["market_id"] for b in memory["bets"] if b["status"] == "open"}
+    analysis = ai_analyse(markets, skip_ids=already_bet)
     if not analysis:
+        log.info("No good opportunity found, skipping silently")
         return
+
+    # Skip if AI is not confident enough
+    true_prob = analysis.get("true_probability", 0)
+    market_price = analysis.get("market_price", 0.5)
+    mode = analysis.get("mode", "lottery")
+
+    if mode == "value" and true_prob and market_price:
+        edge = true_prob - market_price
+        if edge < 0.10:  # need at least 10% edge for value bets
+            log.info("Edge too small (%.2f), skipping", edge)
+            return
+    elif mode == "lottery" and market_price:
+        if market_price > 0.08:  # lottery only if price < 8%
+            log.info("Price too high for lottery (%.2f), skipping", market_price)
+            return
 
     matched = next((m for m in markets if m.get("id") == analysis.get("market_id")), markets[0])
-    pick    = analysis.get("pick", "YES")
-    prices  = parse_prices(matched)
-    price   = prices.get(pick, 0.5)
-    bet_pct = min(analysis.get("bet_pct", 3), 8)
+    pick       = analysis.get("pick", "YES")
+    prices     = parse_prices(matched)
+    price      = prices.get(pick, prices.get("Yes", market_price or 0.5))
+    multiplier = analysis.get("potential_multiplier", round(1/price) if price > 0 else 1)
+    wager      = float(analysis.get("bet_usd", 2))
+    wager      = max(1.0, min(wager, 5.0))
 
     memory = load_memory()
-    wager  = round(memory["balance"] * bet_pct / 100, 2)
-    if wager < 0.01:
+    if memory["balance"] < wager:
+        wager = round(memory["balance"] * 0.02, 2)
+    if wager < 0.5:
         return
 
     memory["balance"] -= wager
@@ -387,6 +411,7 @@ async def _daily_job(ctx: ContextTypes.DEFAULT_TYPE):
         "pick": pick,
         "confidence": analysis.get("confidence", 70),
         "price_at_bet": price,
+        "potential_multiplier": multiplier,
         "wager": wager,
         "status": "open",
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -395,7 +420,6 @@ async def _daily_job(ctx: ContextTypes.DEFAULT_TYPE):
     })
     save_memory(memory)
 
-    mode = analysis.get("mode", "lottery")
     emoji = "🎰" if mode == "lottery" else "🎯"
     await ctx.bot.send_message(
         chat_id=chat_id,
@@ -415,23 +439,23 @@ async def cmd_autostart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # remove old jobs
     for job in ctx.job_queue.get_jobs_by_name(str(chat_id)):
         job.schedule_removal()
-    # run every 1 hour
+    # run every 15 minutes
     ctx.job_queue.run_repeating(
         _daily_job,
-        interval=3600,
-        first=60,
+        interval=900,
+        first=30,
         chat_id=chat_id,
         name=str(chat_id),
     )
     await update.message.reply_text(
         "⏰ *Авторежим увімкнено!*\n\n"
-        "Кожну *годину* бот буде:\n"
-        "1. Перевіряти результати ставок\n"
-        "2. Шукати лотерейні ринки (<8% ціна)\n"
-        "3. Ставити $1-5 на найкращий варіант\n"
-        "4. Звітувати тут\n\n"
-        "Стратегія: багато дрібних ставок, чекаємо x100-x1000 🎰\n"
-        "Перший запуск через 1 хвилину!",
+        "Кожні *15 хвилин* бот буде:\n"
+        "1. Сканувати ринки Polymarket\n"
+        "2. Якщо є хороша можливість — ставить\n"
+        "3. Якщо немає — мовчить і чекає\n"
+        "4. Перевіряє результати старих ставок\n\n"
+        "Стратегія: 🎰 60% лотерея + 🎯 40% value\n"
+        "Перший запуск через 30 секунд! 🚀",
         parse_mode="Markdown",
     )
 
@@ -453,5 +477,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
