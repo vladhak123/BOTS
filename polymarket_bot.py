@@ -1,8 +1,8 @@
 """
-Polymarket Simulation Bot v3.0
+Polymarket Simulation Bot v3.1
 - Claude Haiku для аналізу
 - Батчевий аналіз 100 ринків
-- Тільки ринки що закриються протягом 12 годин
+- Тільки ринки що закриються протягом 18 годин
 - Змішана стратегія: 60% лотерея + 40% value
 - Кожні 30 хвилин автоматично
 - Пам'ять + новини + Kelly Criterion
@@ -13,6 +13,11 @@ from datetime import datetime, timezone, date
 from pathlib import Path
 
 import requests
+try:
+    import httpx
+    HAS_HTTPX = True
+except ImportError:
+    HAS_HTTPX = False
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
@@ -32,7 +37,7 @@ log = logging.getLogger(__name__)
 # 🤖  CLAUDE HAIKU
 # ══════════════════════════════════════════════
 
-def call_claude(prompt: str, max_tokens: int = 600) -> str:
+def call_claude(prompt: str, max_tokens: int = 800) -> str:
     r = requests.post(
         "https://api.anthropic.com/v1/messages",
         headers={
@@ -45,7 +50,7 @@ def call_claude(prompt: str, max_tokens: int = 600) -> str:
             "max_tokens": max_tokens,
             "messages": [{"role": "user", "content": prompt}],
         },
-        timeout=30,
+        timeout=40,
     )
     r.raise_for_status()
     return r.json()["content"][0]["text"].strip()
@@ -165,7 +170,7 @@ def fetch_markets() -> list[dict]:
         end_dt = parse_end_date(m)
         if end_dt:
             hours_left = (end_dt - now).total_seconds() / 3600
-            if hours_left < 0 or hours_left > 12:
+            if hours_left < 0 or hours_left > 18:
                 continue
 
         # diversity filter: max 2 per topic
@@ -240,15 +245,19 @@ def build_context(memory: dict) -> str:
         lines.append(f"- {b['question'][:60]} | {b['pick']} | {result} | ${b.get('pnl', 0):.2f}")
     return "\n".join(lines)
 
-def kelly_bet(edge: float, price: float, balance: float) -> float:
+def kelly_bet(edge: float, price: float, balance: float, fraction: float = 0.25) -> float:
+    """Fractional Kelly (25%) — менший ризик, менша дисперсія."""
     try:
+        if edge <= 0 or price <= 0 or price >= 1:
+            return 1.0
         odds = (1 / price) - 1
         if odds <= 0:
-            return 2.0
-        kelly_f = min(abs(edge) / odds, 0.05)
-        return max(1.0, min(round(balance * kelly_f, 2), 5.0))
+            return 1.0
+        full_kelly = edge / odds
+        wager = balance * full_kelly * fraction
+        return max(1.0, min(round(wager, 2), balance * 0.05))  # макс 5% балансу
     except Exception:
-        return 2.0
+        return 1.0
 
 def ai_analyse_batch(batch: list, mode: str, context: str, news_str: str) -> dict | None:
     summaries = []
@@ -267,41 +276,49 @@ def ai_analyse_batch(batch: list, mode: str, context: str, news_str: str) -> dic
         strategy = "VALUE: Найди рынок где толпа ошибается на 10%+ в вероятности."
         bet_field = '"bet_usd": <3-5>,'
 
-    prompt = f"""Ты эксперт по prediction markets.
+    prompt = f"""Ты эксперт по prediction markets с многолетним опытом.
 
-ИСТОРИЯ СТАВОК:
+ТВОИ ПРОШЛЫЕ СТАВКИ (учись на них):
 {context}
 
-НОВОСТИ:
+АКТУАЛЬНЫЕ НОВОСТИ:
 {news_str}
 
-РЫНКИ:
+ДОСТУПНЫЕ РЫНКИ:
 {chr(10).join(summaries)}
 
 ЗАДАЧА: {strategy}
 
+ШАГ 1 - АНАЛИЗ: Сначала подумай в поле thoughts:
+- Какой рынок самый интересный и почему?
+- Что реально происходит в мире по этой теме?
+- Чем текущая цена отличается от реальной вероятности?
+
+ШАГ 2 - РЕШЕНИЕ: После анализа выдай JSON.
+
 ПРАВИЛА:
 - Никогда не выбирай рынки с прошедшими датами
-- Пиши reason на РУССКОМ языке
-- Переведи question на русский
-- Если нет хорошей возможности — верни score: 0
+- Все текстовые поля на РУССКОМ языке
+- Если нет хорошей возможности - верни score: 0
 
 Ответь ТОЛЬКО валидным JSON без markdown:
 {{
+  "thoughts": "<твои рассуждения 2-3 предложения>",
   "mode": "{mode}",
   "market_id": "<id>",
   "question": "<перевод на русский>",
   "pick": "<YES или NO>",
-  "market_price": <число>,
-  "true_probability": <твоя оценка>,
+  "market_price": <число от 0.01 до 0.99>,
+  "true_probability": <твоя честная оценка от 0.01 до 0.99>,
   "potential_multiplier": <целое число>,
-  "reason": "<2-3 предложения на русском>",
+  "reason": "<вывод на русском 2-3 предложения>",
   {bet_field}
   "score": <0-100>
-}}"""
+}}
+"""
 
     try:
-        text = call_claude(prompt, max_tokens=400)
+        text = call_claude(prompt, max_tokens=600)
         if "```" in text:
             text = text.split("```")[1]
             if text.startswith("json"):
@@ -499,7 +516,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Claude Haiku AI + новости + память ошибок\n"
         "Стратегия: 🎰 60% лотерея + 🎯 40% value\n"
         "Частота: каждые 30 минут\n"
-        "Рынки: только закрываются в течение 12ч",
+        "Рынки: только закрываются в течение 18ч",
         parse_mode="Markdown",
         reply_markup=main_keyboard(),
     )
