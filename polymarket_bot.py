@@ -203,7 +203,7 @@ def filter_good_markets(markets: list[dict]) -> list[dict]:
 
         # Volume filter: skip low liquidity markets
         vol = float(m.get("volume24hr") or m.get("volumeClob") or 0)
-        if vol < 1000:
+        if vol < 100:
             continue
 
         # Price filter: skip if all prices are extreme (>95% or <1%)
@@ -642,20 +642,24 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif query.data == "check":     await _do_check(msg)
 
 async def _do_analyse(message):
-    msg = await message.reply_text("⏳ Завантажую до 2000 ринків (async)...")
-    memory  = load_memory()
-    markets = fetch_markets()
-    if not markets:
-        await msg.edit_text("❌ Не знайдено ринків що закриваються в найближчі 48 годин.")
-        return
-    await msg.edit_text(f"🧠 Claude аналізує {len(markets)} ринків з новинами...")
-    already_bet = {b["market_id"] for b in memory["bets"] if b["status"] == "open"}
-    analysis = ai_analyse(markets, memory, skip_ids=already_bet)
-    if not analysis:
-        await msg.edit_text("❌ Claude не знайшов хорошої можливості зараз.")
-        return
-    await msg.delete()
-    await place_bet(message, memory, analysis, markets)
+    msg = await message.reply_text("⏳ Завантажую ринки...")
+    try:
+        memory  = load_memory()
+        markets = fetch_markets()
+        if not markets:
+            await msg.edit_text("❌ Не знайдено ринків. Спробуй пізніше.")
+            return
+        await msg.edit_text(f"🧠 Claude аналізує {len(markets)} ринків...")
+        already_bet = {b["market_id"] for b in memory["bets"] if b["status"] == "open"}
+        analysis = ai_analyse(markets, memory, skip_ids=already_bet)
+        if not analysis:
+            await msg.edit_text("❌ Claude не знайшов хорошої можливості зараз.")
+            return
+        await msg.delete()
+        await place_bet(message, memory, analysis, markets)
+    except Exception as e:
+        log.error("Analyse error: %s", e)
+        await msg.edit_text(f"❌ Помилка: {str(e)[:100]}")
 
 async def _do_stats(message):
     memory = load_memory()
