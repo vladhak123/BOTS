@@ -201,11 +201,6 @@ def filter_good_markets(markets: list[dict]) -> list[dict]:
             if hours_left < 0 or hours_left > 48:
                 continue
 
-        # Volume filter: skip low liquidity markets
-        vol = float(m.get("volume24hr") or m.get("volumeClob") or 0)
-        if vol < 100:
-            continue
-
         # Price filter: skip if all prices are extreme (>95% or <1%)
         prices = parse_prices(m)
         if prices:
