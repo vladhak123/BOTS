@@ -2,7 +2,7 @@
 Polymarket Simulation Bot v3.0
 - Claude Haiku для аналізу
 - Батчевий аналіз 100 ринків
-- Тільки ринки що закриються протягом 24 годин
+- Тільки ринки що закриються протягом 12 годин
 - Змішана стратегія: 60% лотерея + 40% value
 - Кожні 30 хвилин автоматично
 - Пам'ять + новини + Kelly Criterion
@@ -22,7 +22,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 TG_TOKEN         = os.environ.get("TG_TOKEN", "YOUR_TOKEN_HERE")
 ANTHROPIC_KEY    = os.environ.get("ANTHROPIC_KEY", "YOUR_ANTHROPIC_KEY_HERE")
 MEMORY_FILE      = os.environ.get("MEMORY_FILE", "bot_memory.json")
-STARTING_BALANCE = 100.0
+STARTING_BALANCE = 1000.0
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -165,7 +165,7 @@ def fetch_markets() -> list[dict]:
         end_dt = parse_end_date(m)
         if end_dt:
             hours_left = (end_dt - now).total_seconds() / 3600
-            if hours_left < 0 or hours_left > 24:
+            if hours_left < 0 or hours_left > 12:
                 continue
 
         # diversity filter: max 2 per topic
@@ -500,7 +500,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Claude Haiku AI + новости + память ошибок\n"
         "Стратегия: 🎰 60% лотерея + 🎯 40% value\n"
         "Частота: каждые 30 минут\n"
-        "Рынки: только закрываются в течение 24ч",
+        "Рынки: только закрываются в течение 12ч",
         parse_mode="Markdown",
         reply_markup=main_keyboard(),
     )
