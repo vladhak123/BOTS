@@ -22,7 +22,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 TG_TOKEN   = os.environ.get("TG_TOKEN", "8647895785:AAESQ2oSwnTNCXW9y9RjgsWvMZjyS_mX3iA")
 CLAUDE_KEY       = os.environ.get("CLAUDE_KEY", "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")
 MEMORY_FILE      = os.environ.get("MEMORY_FILE", "bot_memory.json")
-STARTING_BALANCE = 100.0
+STARTING_BALANCE = 1000.0
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -500,7 +500,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Claude Haiku AI + новости + память ошибок\n"
         "Стратегия: 🎰 60% лотерея + 🎯 40% value\n"
         "Частота: каждые 30 минут\n"
-        "Рынки: только закрываются в течение 12ч",
+        "Рынки: только закрываются в течение 24ч",
         parse_mode="Markdown",
         reply_markup=main_keyboard(),
     )
@@ -700,6 +700,75 @@ async def cmd_history(u, c):   await _do_history(u.message)
 async def cmd_autostart(u, c): await _do_autostart(u.message, c)
 async def cmd_autostop(u, c):  await _do_autostop(u.message, c)
 
+async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = await update.message.reply_text("🔍 Проверяю все подключения...")
+    lines = []
+
+    # 1. Polymarket API
+    try:
+        r = requests.get("https://gamma-api.polymarket.com/markets",
+                        params={"limit": 5, "active": "true"}, timeout=10)
+        r.raise_for_status()
+        markets = r.json()
+        lines.append(f"✅ Polymarket API — работает ({len(markets)} рынков получено)")
+    except Exception as e:
+        lines.append(f"❌ Polymarket API — ошибка: {str(e)[:50]}")
+
+    # 2. Claude API
+    try:
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": os.environ.get("ANTHROPIC_KEY", ""),
+                     "anthropic-version": "2023-06-01",
+                     "Content-Type": "application/json"},
+            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 10,
+                  "messages": [{"role": "user", "content": "say ok"}]},
+            timeout=15,
+        )
+        r.raise_for_status()
+        lines.append("✅ Claude Haiku API — работает")
+    except Exception as e:
+        lines.append(f"❌ Claude API — ошибка: {str(e)[:80]}")
+
+    # 3. Markets within 24h
+    try:
+        now = datetime.now(timezone.utc)
+        r = requests.get("https://gamma-api.polymarket.com/markets",
+                        params={"limit": 100, "active": "true", "closed": "false"}, timeout=10)
+        markets = r.json()
+        valid = []
+        for m in markets:
+            for field in ["endDate", "end_date", "expirationTime"]:
+                val = m.get(field)
+                if val:
+                    try:
+                        end_dt = datetime.fromisoformat(str(val).replace("Z", "+00:00"))
+                        hours = (end_dt - now).total_seconds() / 3600
+                        if 0 < hours <= 24:
+                            valid.append(m)
+                    except Exception:
+                        pass
+                    break
+        lines.append(f"✅ Рынков в ближайшие 24ч: {len(valid)}")
+    except Exception as e:
+        lines.append(f"❌ Ошибка подсчёта рынков: {str(e)[:50]}")
+
+    # 4. Memory
+    try:
+        memory = load_memory()
+        open_bets = sum(1 for b in memory["bets"] if b["status"] == "open")
+        lines.append(f"✅ Память — баланс ${memory['balance']:.2f}, открытых ставок: {open_bets}")
+    except Exception as e:
+        lines.append(f"❌ Память — ошибка: {str(e)[:50]}")
+
+    # 5. Env vars
+    tg  = "✅" if os.environ.get("TG_TOKEN") else "❌"
+    ant = "✅" if os.environ.get("ANTHROPIC_KEY") else "❌"
+    lines.append(f"{tg} TG_TOKEN | {ant} ANTHROPIC_KEY")
+
+    result = "\n".join(lines)
+    await msg.edit_text(f"\U0001f50d *Диагностика:*\n\n{result}", parse_mode="Markdown")
+
 def main():
     app = Application.builder().token(TG_TOKEN).build()
     app.add_handler(CommandHandler("start",     cmd_start))
@@ -711,6 +780,8 @@ def main():
     app.add_handler(CommandHandler("history",   cmd_history))
     app.add_handler(CommandHandler("autostart", cmd_autostart))
     app.add_handler(CommandHandler("autostop",  cmd_autostop))
+    app.add_handler(CommandHandler("check",      cmd_check))
+    app.add_handler(CommandHandler("check",      cmd_check))
     app.add_handler(CallbackQueryHandler(button_handler))
     log.info("🚀 Bot v3.0 started!")
     app.run_polling()
