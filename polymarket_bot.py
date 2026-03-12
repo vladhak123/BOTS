@@ -2,7 +2,7 @@
 Polymarket Simulation Bot v3.0
 - Claude Haiku для аналізу
 - Батчевий аналіз 100 ринків
-- Тільки ринки що закриються протягом 12 годин
+- Тільки ринки що закриються протягом 24 годин
 - Змішана стратегія: 60% лотерея + 40% value
 - Кожні 30 хвилин автоматично
 - Пам'ять + новини + Kelly Criterion
@@ -19,10 +19,10 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 # ─────────────────────────────────────────────
 # 🔑  ENV VARS
 # ─────────────────────────────────────────────
-TG_TOKEN         = os.environ.get("TG_TOKEN", "8647895785:AAESQ2oSwnTNCXW9y9RjgsWvMZjyS_mX3iA")
-ANTHROPIC_KEY    = os.environ.get("ANTHROPIC_KEY", "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")
+TG_TOKEN         = os.environ.get("TG_TOKEN", "YOUR_TOKEN_HERE")
+ANTHROPIC_KEY    = os.environ.get("ANTHROPIC_KEY", "YOUR_ANTHROPIC_KEY_HERE")
 MEMORY_FILE      = os.environ.get("MEMORY_FILE", "bot_memory.json")
-STARTING_BALANCE = 1000.0
+STARTING_BALANCE = 100.0
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
