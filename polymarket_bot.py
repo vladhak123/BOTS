@@ -2,7 +2,7 @@
 Polymarket Simulation Bot v3.0
 - Claude Haiku для аналізу
 - Батчевий аналіз 100 ринків
-- Тільки ринки що закриються протягом 12 годин
+- Тільки ринки що закриються протягом 24 годин
 - Змішана стратегія: 60% лотерея + 40% value
 - Кожні 30 хвилин автоматично
 - Пам'ять + новини + Kelly Criterion
@@ -165,7 +165,7 @@ def fetch_markets() -> list[dict]:
         if not end_dt:
             continue
         hours_left = (end_dt - now).total_seconds() / 3600
-        if hours_left < 0 or hours_left > 12:
+        if hours_left < 0 or hours_left > 24:
             continue
 
         # diversity filter: max 2 per topic
