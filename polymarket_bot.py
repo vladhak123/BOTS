@@ -22,7 +22,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 TG_TOKEN         = os.environ.get("TG_TOKEN", "YOUR_TOKEN_HERE")
 ANTHROPIC_KEY    = os.environ.get("ANTHROPIC_KEY", "YOUR_ANTHROPIC_KEY_HERE")
 MEMORY_FILE      = os.environ.get("MEMORY_FILE", "bot_memory.json")
-STARTING_BALANCE = 100.0
+STARTING_BALANCE = 1000.0
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -461,7 +461,6 @@ async def place_bet(message, memory: dict, analysis: dict, markets: list):
     save_memory(memory)
 
     emoji = "🎰" if mode == "lottery" else "🎯"
-    market_url = f"https://polymarket.com/market/{matched.get('id', '')}"
     await message.reply_text(
         f"{emoji} *Ставка! [{mode.upper()}]*\n\n"
         f"📋 {analysis.get('question', matched['question'])}\n"
@@ -471,7 +470,7 @@ async def place_bet(message, memory: dict, analysis: dict, markets: list):
         f"🏆 Если выиграет: ~${wager*multiplier:.0f}\n"
         f"💼 Баланс: ${memory['balance']:.2f}\n\n"
         f"🧠 {analysis.get('reason','—')}\n\n"
-        f"🔗 [Открыть рынок]({market_url})",
+        f"\U0001f4cb ID ринку: `{matched.get('id','?')}` (шукай на Polymarket)",
         parse_mode="Markdown",
         disable_web_page_preview=True,
     )
