@@ -1,12 +1,13 @@
 """
-Polymarket Simulation Bot v3.1
-- Claude Haiku для аналізу
-- Батчевий аналіз 800 ринків (8 сторінок)
-- Тільки ринки що закриються протягом 12 годин
-- Фільтр дат в назві питання (не ставить на "March 15" і т.д.)
+Polymarket Simulation Bot v3.2
+- Claude Haiku з веб-пошуком (реальні ціни + новини)
+- Аналіз 800 ринків (8 сторінок Polymarket)
+- Тільки ринки що закриються протягом 48 годин
+- Фільтр дат в назві питання
 - Змішана стратегія: 60% лотерея + 40% value
 - Кожні 30 хвилин автоматично
-- Пам'ять + новини + Kelly Criterion + /check діагностика
+- Стартовий баланс $100
+- Kelly Criterion + /check діагностика
 """
 
 import json, os, re, random, logging
@@ -172,7 +173,7 @@ def fetch_markets() -> list[dict]:
                 _mn = MONTHS.get(_mon[:3], 0)
                 if _mn:
                     _candidate = date(now.year, _mn, int(_day))
-                    if (_candidate - now.date()).days > 1:
+                    if (_candidate - now.date()).days > 2:
                         _skip = True
                         break
             except Exception:
@@ -185,7 +186,7 @@ def fetch_markets() -> list[dict]:
         end_dt = parse_end_date(m)
         if end_dt:
             hours_left = (end_dt - now).total_seconds() / 3600
-            if hours_left < 0 or hours_left > 12:
+            if hours_left < 0 or hours_left > 48:
                 continue
 
         # diversity filter: max 2 per topic
@@ -527,7 +528,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Claude Haiku AI + новости + память ошибок\n"
         "Стратегия: 🎰 60% лотерея + 🎯 40% value\n"
         "Частота: каждые 30 минут\n"
-        "Рынки: только закрываются в течение 18ч",
+        "Рынки: только закрываются в течение 48ч",
         parse_mode="Markdown",
         reply_markup=main_keyboard(),
     )
