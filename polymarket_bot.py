@@ -23,7 +23,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 # 🔑  ENV VARS
 # ─────────────────────────────────────────────
 TG_TOKEN   = os.environ.get("TG_TOKEN", "8647895785:AAESQ2oSwnTNCXW9y9RjgsWvMZjyS_mX3iA")
-CLAUDE_KEY       = os.environ.get("CLAUDE_KEY", "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")
+CLAUDE_KEY       = os.environ.get("CLAUDE_KEY", "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")
 MEMORY_FILE      = os.environ.get("MEMORY_FILE", "bot_memory.json")
 STARTING_BALANCE = 1000.0
 
