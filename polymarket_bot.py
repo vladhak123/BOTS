@@ -758,29 +758,37 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         lines.append(f"❌ Claude API — ошибка: {str(e)[:80]}")
 
-    # 3. Markets within 24h
+    # 3. Markets within 48h (same logic as fetch_markets)
     try:
         now = datetime.now(timezone.utc)
-        r = requests.get("https://gamma-api.polymarket.com/markets",
-                        params={"limit": 100, "active": "true", "closed": "false"}, timeout=10)
-        markets = r.json()
+        all_m = []
+        for offset in [0, 100, 200, 300, 400, 500, 600, 700]:
+            r2 = requests.get("https://gamma-api.polymarket.com/markets",
+                params={"limit": 100, "active": "true", "closed": "false", "offset": offset}, timeout=10)
+            batch = r2.json()
+            if not batch: break
+            all_m.extend(batch)
         valid = []
-        for m in markets:
-            for field in ["endDate", "end_date", "expirationTime"]:
+        no_date = 0
+        for m in all_m:
+            end_dt = None
+            for field in ["endDate", "end_date", "expirationTime", "endDateIso"]:
                 val = m.get(field)
                 if val:
                     try:
                         end_dt = datetime.fromisoformat(str(val).replace("Z", "+00:00"))
-                        hours = (end_dt - now).total_seconds() / 3600
-                        if 0 < hours <= 24:
-                            valid.append(m)
+                        break
                     except Exception:
                         pass
-                    break
-        lines.append(f"✅ Рынков в ближайшие 24ч: {len(valid)}")
+            if end_dt:
+                hours = (end_dt - now).total_seconds() / 3600
+                if 0 < hours <= 48:
+                    valid.append(m)
+            else:
+                no_date += 1
+        lines.append(f"✅ Всього ринків: {len(all_m)} | З датою 48ч: {len(valid)} | Без дати: {no_date}")
     except Exception as e:
         lines.append(f"❌ Ошибка подсчёта рынков: {str(e)[:50]}")
-
     # 4. Memory
     try:
         memory = load_memory()
