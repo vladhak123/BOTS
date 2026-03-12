@@ -22,7 +22,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 TG_TOKEN         = os.environ.get("TG_TOKEN", "YOUR_TOKEN_HERE")
 ANTHROPIC_KEY    = os.environ.get("ANTHROPIC_KEY", "YOUR_ANTHROPIC_KEY_HERE")
 MEMORY_FILE      = os.environ.get("MEMORY_FILE", "bot_memory.json")
-STARTING_BALANCE = 1000.0
+STARTING_BALANCE = 100.0
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
