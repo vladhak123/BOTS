@@ -41,14 +41,14 @@ log = logging.getLogger(__name__)
 
 def call_claude(prompt: str, max_tokens: int = 800) -> str:
     r = requests.post(
-        "https://api.anthropic.com/v1/messages",
+        "https://api.anthropic.com/v1/messages",  # ← FIX: убраны пробелы
         headers={
             "x-api-key": os.environ.get("ANTHROPIC_KEY", ""),
             "anthropic-version": "2023-06-01",
             "Content-Type": "application/json",
         },
         json={
-            "model": "claude-haiku-4-5-20251001",
+            "model": "claude-haiku-4-5-20251001",  # ← твоя рабочая модель
             "max_tokens": max_tokens,
             "messages": [{"role": "user", "content": prompt}],
         },
@@ -134,7 +134,7 @@ def fetch_markets() -> list[dict]:
     for offset in [0, 100, 200, 300, 400, 500, 600, 700]:
         try:
             r = requests.get(
-                "https://gamma-api.polymarket.com/markets",
+                "https://gamma-api.polymarket.com/markets",  # ← FIX: убраны пробелы
                 params={"active": "true", "closed": "false", "limit": 100,
                         "order": "volume24hr", "ascending": "false", "offset": offset},
                 timeout=10,
@@ -144,8 +144,8 @@ def fetch_markets() -> list[dict]:
             if not batch:
                 break
             all_markets.extend(batch)
-        except Exception:
-            pass
+        except Exception as e:  # ← FIX: логирование вместо pass
+            log.warning(f"❌ API error (offset={offset}): {e}")
 
     seen = set()
     unique = []
@@ -211,12 +211,15 @@ def fetch_markets() -> list[dict]:
     random.shuffle(top)
     result = top[:20] if top else valid[:20]
     random.shuffle(result)
+    
+    # ← FIX: отладочный лог
+    log.info(f"📊 Filters: unique={len(unique)}, valid={len(valid)}, lottery={len(lottery)}, result={len(result)}")
     log.info("Fetched %d valid markets (%d lottery)", len(result), len(lottery))
     return result
 
 def fetch_market(market_id: str) -> dict | None:
     try:
-        r = requests.get(f"https://gamma-api.polymarket.com/markets/{market_id}", timeout=10)
+        r = requests.get(f"https://gamma-api.polymarket.com/markets/{market_id}", timeout=10)  # ← FIX: убраны пробелы
         r.raise_for_status()
         return r.json()
     except Exception as e:
@@ -231,7 +234,7 @@ def fetch_market(market_id: str) -> dict | None:
 def fetch_news(query: str) -> str:
     try:
         r = requests.get(
-            "https://api.duckduckgo.com/",
+            "https://api.duckduckgo.com/",  # ← FIX: убраны пробелы
             params={"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"},
             timeout=8,
         )
@@ -243,7 +246,8 @@ def fetch_news(query: str) -> str:
             if isinstance(topic, dict) and topic.get("Text"):
                 snippets.append(topic["Text"][:150])
         return " | ".join(snippets) if snippets else ""
-    except Exception:
+    except Exception as e:
+        log.warning(f"News fetch error: {e}")
         return ""
 
 
@@ -267,12 +271,13 @@ def kelly_bet(edge: float, price: float, balance: float, fraction: float = 0.25)
         if edge <= 0 or price <= 0 or price >= 1:
             return 1.0
         odds = (1 / price) - 1
-        if odds <= 0:
+        if odds <= 1e-9:  # ← FIX: защита от деления на ноль
             return 1.0
         full_kelly = edge / odds
         wager = balance * full_kelly * fraction
         return max(1.0, min(round(wager, 2), balance * 0.05))  # макс 5% балансу
-    except Exception:
+    except Exception as e:
+        log.warning(f"Kelly error: {e}")
         return 1.0
 
 def ai_analyse_batch(batch: list, mode: str, context: str, news_str: str) -> dict | None:
@@ -330,9 +335,11 @@ def ai_analyse_batch(batch: list, mode: str, context: str, news_str: str) -> dic
 """
 
     try:
-        text = call_claude(prompt, max_tokens=800, use_search=True)
+        # ← FIX: убран use_search=True (не был в сигнатуре функции)
+        text = call_claude(prompt, max_tokens=800)
         if "```" in text:
-            text = text.split("```")[1]
+            parts = text.split("```")
+            text = parts[1] if len(parts) > 1 else text
             if text.startswith("json"):
                 text = text[4:]
         result = json.loads(text.strip())
@@ -524,7 +531,7 @@ def main_keyboard():
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 *Polymarket Bot v3.0*\n\n"
+        "🤖 *Polymarket Bot v3.2 FIXED*\n\n"
         "Claude Haiku AI + новости + память ошибок\n"
         "Стратегия: 🎰 60% лотерея + 🎯 40% value\n"
         "Частота: каждые 30 минут\n"
@@ -734,7 +741,7 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # 1. Polymarket API
     try:
-        r = requests.get("https://gamma-api.polymarket.com/markets",
+        r = requests.get("https://gamma-api.polymarket.com/markets",  # ← FIX
                         params={"limit": 5, "active": "true"}, timeout=10)
         r.raise_for_status()
         markets = r.json()
@@ -745,11 +752,11 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # 2. Claude API
     try:
         r = requests.post(
-            "https://api.anthropic.com/v1/messages",
+            "https://api.anthropic.com/v1/messages",  # ← FIX
             headers={"x-api-key": os.environ.get("ANTHROPIC_KEY", ""),
                      "anthropic-version": "2023-06-01",
                      "Content-Type": "application/json"},
-            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 10,
+            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 10,  # ← твоя модель
                   "messages": [{"role": "user", "content": "say ok"}]},
             timeout=15,
         )
@@ -758,12 +765,12 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         lines.append(f"❌ Claude API — ошибка: {str(e)[:80]}")
 
-    # 3. Markets within 48h (same logic as fetch_markets)
+    # 3. Markets within 48h
     try:
         now = datetime.now(timezone.utc)
         all_m = []
         for offset in [0, 100, 200, 300, 400, 500, 600, 700]:
-            r2 = requests.get("https://gamma-api.polymarket.com/markets",
+            r2 = requests.get("https://gamma-api.polymarket.com/markets",  # ← FIX
                 params={"limit": 100, "active": "true", "closed": "false", "offset": offset}, timeout=10)
             batch = r2.json()
             if not batch: break
@@ -789,6 +796,7 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines.append(f"✅ Всього ринків: {len(all_m)} | З датою 48ч: {len(valid)} | Без дати: {no_date}")
     except Exception as e:
         lines.append(f"❌ Ошибка подсчёта рынков: {str(e)[:50]}")
+        
     # 4. Memory
     try:
         memory = load_memory()
@@ -816,10 +824,9 @@ def main():
     app.add_handler(CommandHandler("history",   cmd_history))
     app.add_handler(CommandHandler("autostart", cmd_autostart))
     app.add_handler(CommandHandler("autostop",  cmd_autostop))
-    app.add_handler(CommandHandler("check",      cmd_check))
-    app.add_handler(CommandHandler("check",      cmd_check))
+    app.add_handler(CommandHandler("check", cmd_check))  # ← FIX: убран дубликат
     app.add_handler(CallbackQueryHandler(button_handler))
-    log.info("🚀 Bot v3.0 started!")
+    log.info("🚀 Bot v3.2 FIXED started!")
     app.run_polling()
 
 if __name__ == "__main__":
