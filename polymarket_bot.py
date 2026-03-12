@@ -186,7 +186,7 @@ def fetch_markets() -> list[dict]:
         end_dt = parse_end_date(m)
         if end_dt:
             hours_left = (end_dt - now).total_seconds() / 3600
-            if hours_left < 0 or hours_left > 48:
+            if hours_left < 0 or hours_left > 180:
                 continue
 
         # diversity filter: max 2 per topic
