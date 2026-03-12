@@ -25,7 +25,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 TG_TOKEN   = os.environ.get("TG_TOKEN", "8647895785:AAESQ2oSwnTNCXW9y9RjgsWvMZjyS_mX3iA")
 DS_KEY = os.environ.get("DS_KEY", "sk-7f2b9cc52ff3405baab9824544b129b9")
 MEMORY_FILE      = os.environ.get("MEMORY_FILE", "bot_memory.json")
-STARTING_BALANCE = 1000.0
+STARTING_BALANCE = 100.0
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -124,14 +124,33 @@ def parse_prices(market: dict) -> dict:
 def fetch_markets(limit: int = 100) -> list[dict]:
     now = datetime.now(timezone.utc)
     try:
-        r = requests.get(
-            "https://gamma-api.polymarket.com/markets",
-            params={"active": "true", "closed": "false", "limit": limit,
-                    "order": "volume24hr", "ascending": "false"},
-            timeout=10,
-        )
-        r.raise_for_status()
-        markets = r.json()
+        # Fetch ALL markets with pagination (500+)
+        all_markets = []
+        for offset in [0, 100, 200, 300, 400, 500]:
+            try:
+                r = requests.get(
+                    "https://gamma-api.polymarket.com/markets",
+                    params={"active": "true", "closed": "false", "limit": 100,
+                            "order": "volume24hr", "ascending": "false", "offset": offset},
+                    timeout=10,
+                )
+                r.raise_for_status()
+                batch = r.json()
+                if not batch:
+                    break
+                all_markets.extend(batch)
+            except Exception:
+                pass
+
+        # deduplicate
+        seen = set()
+        markets = []
+        for m in all_markets:
+            mid = m.get("id")
+            if mid and mid not in seen:
+                seen.add(mid)
+                markets.append(m)
+
         valid = []
 
         for m in markets:
@@ -146,13 +165,32 @@ def fetch_markets(limit: int = 100) -> list[dict]:
             if not end_dt:
                 continue  # no end date = skip
             hours_left = (end_dt - now).total_seconds() / 3600
-            if hours_left < 0 or hours_left > 24:
+            if hours_left < 0 or hours_left > 12:
                 continue
             valid.append(m)
 
         if not valid:
             log.warning("No valid markets after filtering!")
             return []
+
+        # DIVERSITY FILTER: max 2 markets per topic to avoid bitcoin spam
+        topic_count = {}
+        diverse = []
+        TOPIC_KEYWORDS = ["bitcoin", "btc", "ethereum", "eth", "trump", "election",
+                          "fed", "rate", "war", "iran", "russia", "china", "nvidia", "apple"]
+        for m in valid:
+            q = m.get("question", "").lower()
+            topic = "other"
+            for kw in TOPIC_KEYWORDS:
+                if kw in q:
+                    topic = kw
+                    break
+            count = topic_count.get(topic, 0)
+            if count < 2:  # max 2 per topic
+                topic_count[topic] = count + 1
+                diverse.append(m)
+
+        valid = diverse if diverse else valid
 
         # prefer lottery markets
         lottery = []
@@ -168,7 +206,7 @@ def fetch_markets(limit: int = 100) -> list[dict]:
         random.shuffle(top)
         result = top[:20] if top else valid[:20]
         random.shuffle(result)
-        log.info("Fetched %d valid markets (%d lottery)", len(result), len(lottery))
+        log.info("Fetched %d valid diverse markets (%d lottery)", len(result), len(lottery))
         return result
     except Exception as e:
         log.error("Polymarket fetch error: %s", e)
@@ -234,102 +272,100 @@ def kelly_bet(edge: float, price: float, balance: float, max_pct: float = 0.05) 
     except Exception:
         return 2.0
 
-def ai_analyse(markets: list[dict], memory: dict, skip_ids: set = None) -> dict | None:
-    skip_ids = skip_ids or set()
-    markets = [m for m in markets if m.get("id") not in skip_ids]
-    if not markets:
-        return None
-
+def ai_analyse_batch(batch, mode, context, news_str):
     summaries = []
-    for m in markets:
+    for m in batch:
         prices = parse_prices(m)
         price_str = ", ".join(f"{o}: {p:.1%}" for o, p in prices.items())
         vol = m.get("volume24hr", 0)
         end_dt = parse_end_date(m)
         hours = f"{(end_dt - datetime.now(timezone.utc)).total_seconds()/3600:.0f}h" if end_dt else "?"
-        summaries.append(f"• [id:{m.get('id','?')}] {m['question']} | {price_str} | Vol:${vol} | Closes:{hours}")
-
-    mode = random.choices(["lottery", "value"], weights=[60, 40])[0]
-    context = build_context(memory)
-
-    # fetch news for top 3 markets
-    news_parts = []
-    for m in markets[:3]:
-        q = m["question"][:50]
-        news = fetch_news(q)
-        if "No recent" not in news and "unavailable" not in news:
-            news_parts.append(f"News for '{q}': {news[:200]}")
-    news_str = "\n".join(news_parts) if news_parts else "No relevant news found."
+        summaries.append(f"- [id:{m.get('id','?')}] {m['question']} | {price_str} | Vol:${vol} | Closes:{hours}")
 
     if mode == "lottery":
-        strategy = "LOTTERY: Find ONE market where a LOW-probability outcome (<8%) is secretly more likely than the crowd thinks. Pick the CHEAP side for maximum multiplier."
-        json_template = """{
-  "mode": "lottery",
-  "market_id": "<id>",
-  "question": "<exact question>",
-  "pick": "<YES or NO - the cheap side>",
-  "market_price": <decimal e.g. 0.03>,
-  "true_probability": <your estimate 0.0-1.0>,
-  "potential_multiplier": <round(1/market_price)>,
-  "reason": "<2-3 sentences>",
-  "bet_usd": <1-3>
-}"""
+        strategy = "LOTTERY: Find ONE market where LOW-probability outcome (<8%) is secretly more likely than crowd. Pick CHEAP side."
+        extra = '"bet_usd": <1-3>,'
     else:
-        strategy = "VALUE: Find ONE market where crowd probability is WRONG by 10%+. Pick either side if clearly mispriced."
-        json_template = """{
-  "mode": "value",
-  "market_id": "<id>",
-  "question": "<exact question>",
-  "pick": "<YES or NO>",
-  "market_price": <decimal>,
-  "true_probability": <your estimate>,
-  "potential_multiplier": <round(true_prob/market_price, 1)>,
-  "reason": "<2-3 sentences>",
-  "bet_usd": <3-5>
-}"""
+        strategy = "VALUE: Find ONE market where crowd is WRONG by 10%+."
+        extra = '"bet_usd": <3-5>,'
 
-    prompt = f"""You are an elite prediction-market trader with a track record of finding mispriced markets.
+    prompt = f"""Elite prediction-market trader task.
 
-=== RECENT PERFORMANCE (learn from this) ===
+RECENT PERFORMANCE:
 {context}
 
-=== CURRENT NEWS ===
+NEWS:
 {news_str}
 
-=== AVAILABLE MARKETS ===
+MARKETS:
 {chr(10).join(summaries)}
 
-=== YOUR TASK ===
-{strategy}
+TASK: {strategy}
 
-IMPORTANT RULES:
-- NEVER pick markets about past dates
-- Only pick markets you have genuine insight on
-- Be honest about uncertainty
-- Write the "reason" field in RUSSIAN language (Русский язык)
-- Translate the "question" field to Russian too
+RULES: Never pick past-date markets. Write reason in RUSSIAN. Translate question to Russian.
+If no good opportunity: return {{"score": 0}}
 
-Reply ONLY with valid JSON, no markdown:
-{json_template}"""
+Reply ONLY valid JSON:
+{{
+  "mode": "{mode}",
+  "market_id": "<id>",
+  "question": "<translated to Russian>",
+  "pick": "<YES or NO>",
+  "market_price": <decimal>,
+  "true_probability": <estimate>,
+  "potential_multiplier": <integer>,
+  "reason": "<2-3 sentences in Russian>",
+  {extra}
+  "score": <0-100>
+}}"""
 
     try:
-        text = call_deepseek(prompt, max_tokens=500)
+        text = call_deepseek(prompt, max_tokens=400)
         if "```" in text:
             text = text.split("```")[1]
             if text.startswith("json"):
                 text = text[4:]
         result = json.loads(text.strip())
-        if "bet_pct" not in result:
-            result["bet_pct"] = 2
+        result.setdefault("bet_pct", 2)
         return result
     except Exception as e:
-        log.error("DeepSeek error: %s", e)
+        log.error("Batch error: %s", e)
         return None
 
 
-# ══════════════════════════════════════════════
-# 📊  RESOLVE BETS
-# ══════════════════════════════════════════════
+def ai_analyse(markets, memory, skip_ids=None):
+    skip_ids = skip_ids or set()
+    markets = [m for m in markets if m.get("id") not in skip_ids]
+    if not markets:
+        return None
+
+    mode    = random.choices(["lottery", "value"], weights=[60, 40])[0]
+    context = build_context(memory)
+
+    news_parts = []
+    for m in markets[:3]:
+        news = fetch_news(m["question"][:50])
+        if "No recent" not in news and "unavailable" not in news:
+            news_parts.append(f"{m['question'][:40]}: {news[:150]}")
+    news_str = "\n".join(news_parts) if news_parts else "No relevant news."
+
+    batches = [markets[i:i+30] for i in range(0, len(markets), 30)]
+    log.info("Analysing %d markets in %d batches (mode=%s)", len(markets), len(batches), mode)
+
+    candidates = []
+    for i, batch in enumerate(batches):
+        log.info("Batch %d/%d", i+1, len(batches))
+        result = ai_analyse_batch(batch, mode, context, news_str)
+        if result and result.get("score", 0) > 30 and result.get("market_id"):
+            candidates.append(result)
+
+    if not candidates:
+        log.info("No good opportunities found")
+        return None
+
+    best = max(candidates, key=lambda x: x.get("score", 0))
+    log.info("Best score=%d: %s", best.get("score", 0), best.get("question", "")[:50])
+    return best
 
 def resolve_bets(memory: dict) -> list[str]:
     msgs = []
@@ -507,6 +543,7 @@ async def _do_analyse(message):
     save_memory(memory)
 
     emoji = "🎰" if mode == "lottery" else "🎯"
+    market_url = f"https://polymarket.com/market/{matched.get('id', '')}"
     await msg.edit_text(
         f"{emoji} *Ставка зроблена! [{mode.upper()}]*\n\n"
         f"📋 {matched['question']}\n"
@@ -515,8 +552,10 @@ async def _do_analyse(message):
         f"💰 Ставка: ${wager:.2f} (Kelly)\n"
         f"🏆 Якщо виграє: ~${wager*multiplier:.0f}\n"
         f"💼 Баланс: ${memory['balance']:.2f}\n\n"
-        f"🧠 {analysis.get('reason','—')}",
+        f"🧠 {analysis.get('reason','—')}\n\n"
+        f"🔗 [Переглянути ринок]({market_url})",
         parse_mode="Markdown",
+        disable_web_page_preview=True,
     )
 
 async def _do_stats(message):
@@ -716,6 +755,7 @@ async def _auto_job(ctx: ContextTypes.DEFAULT_TYPE):
     save_memory(memory)
 
     emoji = "🎰" if mode == "lottery" else "🎯"
+    market_url = f"https://polymarket.com/market/{matched.get('id', '')}"
     await ctx.bot.send_message(
         chat_id=chat_id,
         text=(
@@ -724,9 +764,11 @@ async def _auto_job(ctx: ContextTypes.DEFAULT_TYPE):
             f"📌 *{pick}* @ {price:.1%} | x{multiplier}\n"
             f"💰 ${wager:.2f} → виграш ~${wager*multiplier:.0f}\n"
             f"💼 Баланс: ${memory['balance']:.2f}\n\n"
-            f"🧠 {analysis.get('reason','—')}"
+            f"🧠 {analysis.get('reason','—')}\n\n"
+            f"🔗 [Переглянути ринок]({market_url})"
         ),
         parse_mode="Markdown",
+        disable_web_page_preview=True,
     )
 
 # Commands (text fallback)
