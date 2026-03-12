@@ -129,7 +129,7 @@ def parse_prices(market: dict) -> dict:
 def fetch_markets() -> list[dict]:
     now = datetime.now(timezone.utc)
     all_markets = []
-    for offset in [0, 100]:
+    for offset in [0, 100, 200, 300, 400, 500, 600, 700]:
         try:
             r = requests.get(
                 "https://gamma-api.polymarket.com/markets",
@@ -164,13 +164,27 @@ def fetch_markets() -> list[dict]:
             continue
         if is_question_expired(question):
             continue
+        # Skip if question mentions a specific future date more than 1 day away
+        _skip = False
+        for _mon, _day in re.findall(r'(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[ ]+([0-9]{1,2})', question.lower()):
+            try:
+                _mn = MONTHS.get(_mon[:3], 0)
+                if _mn:
+                    _candidate = date(now.year, _mn, int(_day))
+                    if (_candidate - now.date()).days > 1:
+                        _skip = True
+                        break
+            except Exception:
+                pass
+        if _skip:
+            log.info("Skipping future date in title: %s", question[:60])
+            continue
         if m.get("resolved") or m.get("closed"):
             continue
         end_dt = parse_end_date(m)
-        end_dt = parse_end_date(m)
         if end_dt:
             hours_left = (end_dt - now).total_seconds() / 3600
-            if hours_left < 0 or hours_left > 18:
+            if hours_left < 0 or hours_left > 12:
                 continue
 
         # diversity filter: max 2 per topic
