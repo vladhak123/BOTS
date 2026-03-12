@@ -2,7 +2,7 @@
 Polymarket Simulation Bot v3.0
 - Claude Haiku для аналізу
 - Батчевий аналіз 100 ринків
-- Тільки ринки що закриються протягом 24 годин
+- Тільки ринки що закриються протягом 12 годин
 - Змішана стратегія: 60% лотерея + 40% value
 - Кожні 30 хвилин автоматично
 - Пам'ять + новини + Kelly Criterion
@@ -19,8 +19,8 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 # ─────────────────────────────────────────────
 # 🔑  ENV VARS
 # ─────────────────────────────────────────────
-TG_TOKEN   = os.environ.get("TG_TOKEN", "8647895785:AAESQ2oSwnTNCXW9y9RjgsWvMZjyS_mX3iA")
-CLAUDE_KEY       = os.environ.get("CLAUDE_KEY", "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")
+TG_TOKEN         = os.environ.get("TG_TOKEN", "8647895785:AAESQ2oSwnTNCXW9y9RjgsWvMZjyS_mX3iA")
+ANTHROPIC_KEY    = os.environ.get("ANTHROPIC_KEY", "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")
 MEMORY_FILE      = os.environ.get("MEMORY_FILE", "bot_memory.json")
 STARTING_BALANCE = 1000.0
 
@@ -162,11 +162,11 @@ def fetch_markets() -> list[dict]:
         if m.get("resolved") or m.get("closed"):
             continue
         end_dt = parse_end_date(m)
-        if not end_dt:
-            continue
-        hours_left = (end_dt - now).total_seconds() / 3600
-        if hours_left < 0 or hours_left > 24:
-            continue
+        end_dt = parse_end_date(m)
+        if end_dt:
+            hours_left = (end_dt - now).total_seconds() / 3600
+            if hours_left < 0 or hours_left > 24:
+                continue
 
         # diversity filter: max 2 per topic
         q = question.lower()
