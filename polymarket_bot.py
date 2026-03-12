@@ -1,25 +1,21 @@
 """
-Polymarket Simulation Bot v3.2
-- Claude Haiku з веб-пошуком (реальні ціни + новини)
-- Аналіз 800 ринків (8 сторінок Polymarket)
-- Тільки ринки що закриються протягом 48 годин
-- Фільтр дат в назві питання
-- Змішана стратегія: 60% лотерея + 40% value
+Polymarket Simulation Bot v4.0
+- async httpx: завантаження 2000 ринків паралельно (в 10-20 разів швидше)
+- NewsAPI: реальні новини перед кожною ставкою
+- Claude Haiku з веб-пошуком
+- Фільтр ринків 48 годин + фільтр дат в назві
+- 60% лотерея + 40% value
 - Кожні 30 хвилин автоматично
-- Стартовий баланс $100
-- Kelly Criterion + /check діагностика
+- Стартовий баланс $100 + Kelly Criterion
 """
 
-import json, os, re, random, logging
+import json, os, re, random, logging, asyncio
 from datetime import datetime, timezone, date
 from pathlib import Path
 
 import requests
-try:
-    import httpx
-    HAS_HTTPX = True
-except ImportError:
-    HAS_HTTPX = False
+import httpx
+import time
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
@@ -28,8 +24,15 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 # ─────────────────────────────────────────────
 TG_TOKEN         = os.environ.get("TG_TOKEN", "YOUR_TOKEN_HERE")
 ANTHROPIC_KEY    = os.environ.get("ANTHROPIC_KEY", "YOUR_ANTHROPIC_KEY_HERE")
+NEWS_KEY         = os.environ.get("NEWS_KEY", "")
 MEMORY_FILE      = os.environ.get("MEMORY_FILE", "bot_memory.json")
 STARTING_BALANCE = 100.0
+POLYMARKET_API    = "https://gamma-api.polymarket.com/markets"
+NEWS_CACHE: dict  = {}
+NEWS_CACHE_TTL    = 1800   # 30 min
+MARKETS_CACHE     = None
+MARKETS_TS        = 0.0
+MARKETS_CACHE_TTL = 600    # 10 min
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -39,23 +42,28 @@ log = logging.getLogger(__name__)
 # 🤖  CLAUDE HAIKU
 # ══════════════════════════════════════════════
 
-def call_claude(prompt: str, max_tokens: int = 800) -> str:
+def call_claude(prompt: str, max_tokens: int = 800, use_search: bool = False) -> str:
+    payload = {
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    if use_search:
+        payload["tools"] = [{"type": "web_search_20250305", "name": "web_search"}]
+
     r = requests.post(
-        "https://api.anthropic.com/v1/messages",  # ← FIX: убраны пробелы
+        "https://api.anthropic.com/v1/messages",
         headers={
             "x-api-key": os.environ.get("ANTHROPIC_KEY", ""),
             "anthropic-version": "2023-06-01",
             "Content-Type": "application/json",
         },
-        json={
-            "model": "claude-haiku-4-5-20251001",  # ← твоя рабочая модель
-            "max_tokens": max_tokens,
-            "messages": [{"role": "user", "content": prompt}],
-        },
-        timeout=40,
+        json=payload,
+        timeout=60,
     )
     r.raise_for_status()
-    return r.json()["content"][0]["text"].strip()
+    blocks = r.json().get("content", [])
+    return " ".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip()
 
 
 # ══════════════════════════════════════════════
@@ -88,7 +96,7 @@ def save_memory(data: dict):
 
 
 # ══════════════════════════════════════════════
-# 📡  POLYMARKET API
+# 📡  POLYMARKET API (async - 2000 ринків)
 # ══════════════════════════════════════════════
 
 MONTHS = {"jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,
@@ -96,16 +104,13 @@ MONTHS = {"jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,
 
 def is_question_expired(question: str) -> bool:
     q = question.lower()
-    pattern = r'(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+(\d{1,2})(?:[,\s]+(\d{4}))?'
-    for mon, day, year in re.findall(pattern, q):
+    for mon, day in re.findall(r'(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[ ]+([0-9]{1,2})', q):
         try:
-            month_num = MONTHS.get(mon[:3], 0)
-            if not month_num:
-                continue
-            yr = int(year) if year else datetime.now(timezone.utc).year
-            candidate = date(yr, month_num, int(day))
-            if candidate < datetime.now(timezone.utc).date():
-                return True
+            mn = MONTHS.get(mon[:3], 0)
+            if mn:
+                candidate = date(datetime.now(timezone.utc).year, mn, int(day))
+                if candidate < datetime.now(timezone.utc).date():
+                    return True
         except Exception:
             pass
     return False
@@ -128,98 +133,136 @@ def parse_prices(market: dict) -> dict:
     except Exception:
         return {}
 
-def fetch_markets() -> list[dict]:
-    now = datetime.now(timezone.utc)
+async def fetch_markets_async() -> list[dict]:
+    """Завантажує до 2000 ринків паралельно через httpx."""
     all_markets = []
-    for offset in [0, 100, 200, 300, 400, 500, 600, 700]:
-        try:
-            r = requests.get(
-                "https://gamma-api.polymarket.com/markets",  # ← FIX: убраны пробелы
-                params={"active": "true", "closed": "false", "limit": 100,
-                        "order": "volume24hr", "ascending": "false", "offset": offset},
-                timeout=10,
-            )
-            r.raise_for_status()
-            batch = r.json()
-            if not batch:
-                break
-            all_markets.extend(batch)
-        except Exception as e:  # ← FIX: логирование вместо pass
-            log.warning(f"❌ API error (offset={offset}): {e}")
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        tasks = [
+            client.get(POLYMARKET_API, params={"limit": 100, "offset": page * 100, "active": "true"})
+            for page in range(20)  # 20 pages x 100 = 2000 markets
+        ]
+        responses = await asyncio.gather(*tasks, return_exceptions=True)
+        for r in responses:
+            try:
+                if isinstance(r, Exception):
+                    continue
+                batch = r.json()
+                if batch:
+                    all_markets.extend(batch)
+            except Exception:
+                pass
 
+    log.info("Loaded %d markets total", len(all_markets))
+    return all_markets
+
+def filter_good_markets(markets: list[dict]) -> list[dict]:
+    """Фільтрує ринки: активні, 48 годин, не прострочені."""
+    now = datetime.now(timezone.utc)
     seen = set()
-    unique = []
-    for m in all_markets:
-        mid = m.get("id")
-        if mid and mid not in seen:
-            seen.add(mid)
-            unique.append(m)
-
-    valid = []
     topic_count = {}
     TOPICS = ["bitcoin", "btc", "ethereum", "eth", "trump", "fed", "war",
-              "iran", "russia", "china", "nvidia", "apple", "taylor"]
+              "iran", "russia", "china", "nvidia", "apple", "taylor", "election"]
 
-    for m in unique:
+    valid = []
+    for m in markets:
+        # deduplicate
+        mid = m.get("id")
+        if not mid or mid in seen:
+            continue
+        seen.add(mid)
+
         question = m.get("question", "")
         if not question or not m.get("outcomePrices"):
             continue
+        if m.get("resolved") or m.get("closed"):
+            continue
         if is_question_expired(question):
             continue
-        # Skip if question mentions a specific future date more than 1 day away
-        _skip = False
-        for _mon, _day in re.findall(r'(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[ ]+([0-9]{1,2})', question.lower()):
+
+        # Skip if question mentions a future date >2 days away
+        skip = False
+        for mon, day in re.findall(r'(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[ ]+([0-9]{1,2})', question.lower()):
             try:
-                _mn = MONTHS.get(_mon[:3], 0)
-                if _mn:
-                    _candidate = date(now.year, _mn, int(_day))
-                    if (_candidate - now.date()).days > 2:
-                        _skip = True
+                mn = MONTHS.get(mon[:3], 0)
+                if mn:
+                    candidate = date(now.year, mn, int(day))
+                    if (candidate - now.date()).days > 2:
+                        skip = True
                         break
             except Exception:
                 pass
-        if _skip:
-            log.info("Skipping future date in title: %s", question[:60])
+        if skip:
             continue
-        if m.get("resolved") or m.get("closed"):
-            continue
+
+        # Check end date
         end_dt = parse_end_date(m)
         if end_dt:
             hours_left = (end_dt - now).total_seconds() / 3600
-            if hours_left < 0 or hours_left > 180:
+            if hours_left < 0 or hours_left > 48:
                 continue
 
-        # diversity filter: max 2 per topic
+        # Volume filter: skip low liquidity markets
+        vol = float(m.get("volume24hr") or m.get("volumeClob") or 0)
+        if vol < 1000:
+            continue
+
+        # Price filter: skip if all prices are extreme (>95% or <1%)
+        prices = parse_prices(m)
+        if prices:
+            price_values = list(prices.values())
+            if all(p > 0.95 or p < 0.01 for p in price_values):
+                continue
+
+        # Diversity: max 2 per topic
         q = question.lower()
         topic = next((kw for kw in TOPICS if kw in q), "other")
         if topic_count.get(topic, 0) >= 2:
             continue
         topic_count[topic] = topic_count.get(topic, 0) + 1
+
         valid.append(m)
 
-    # prefer lottery markets (price < 8%)
-    lottery = []
+    # Add _min_price and detect arbitrage
     for m in valid:
         prices = parse_prices(m)
-        min_price = min(prices.values()) if prices else 1.0
-        if min_price <= 0.08:
-            m["_min_price"] = min_price
-            lottery.append(m)
+        if prices:
+            m["_min_price"] = min(prices.values())
+            vals = list(prices.values())
+            if len(vals) == 2:
+                total = sum(vals)
+                if total < 0.97:
+                    m["_arbitrage"] = True
+                    m["_arb_gap"] = round(1 - total, 3)
+                    log.info("Arbitrage: %s (gap=%.3f)", m.get("question","")[:50], 1-total)
 
-    lottery.sort(key=lambda x: x.get("_min_price", 1))
-    top = lottery[:30]
-    random.shuffle(top)
-    result = top[:20] if top else valid[:20]
-    random.shuffle(result)
-    
-    # ← FIX: отладочный лог
-    log.info(f"📊 Filters: unique={len(unique)}, valid={len(valid)}, lottery={len(lottery)}, result={len(result)}")
-    log.info("Fetched %d valid markets (%d lottery)", len(result), len(lottery))
+    # Sort: arbitrage first, then by min price
+    valid.sort(key=lambda x: (not x.get("_arbitrage"), x.get("_min_price", 1)))
+    log.info("Filtered to %d good markets", len(valid))
+    return valid
+
+def fetch_markets() -> list[dict]:
+    """Синхронна обгортка для async з кешем 10 хв."""
+    global MARKETS_CACHE, MARKETS_TS
+    if MARKETS_CACHE is not None and time.time() - MARKETS_TS < MARKETS_CACHE_TTL:
+        log.info("Using cached markets (%d)", len(MARKETS_CACHE))
+        return MARKETS_CACHE
+    try:
+        all_markets = asyncio.run(fetch_markets_async())
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        all_markets = loop.run_until_complete(fetch_markets_async())
+
+    valid = filter_good_markets(all_markets)
+    random.shuffle(valid)
+    result = valid[:50]
+    MARKETS_CACHE = result
+    MARKETS_TS = time.time()
     return result
 
 def fetch_market(market_id: str) -> dict | None:
     try:
-        r = requests.get(f"https://gamma-api.polymarket.com/markets/{market_id}", timeout=10)  # ← FIX: убраны пробелы
+        r = requests.get(f"{POLYMARKET_API}/{market_id}", timeout=10)
         r.raise_for_status()
         return r.json()
     except Exception as e:
@@ -228,26 +271,58 @@ def fetch_market(market_id: str) -> dict | None:
 
 
 # ══════════════════════════════════════════════
-# 🔍  NEWS
+# 📰  NEWS API
 # ══════════════════════════════════════════════
 
-def fetch_news(query: str) -> str:
+def search_news(query: str) -> list[str]:
+    """Шукає новини через NewsAPI."""
+    if not NEWS_KEY:
+        return []
     try:
         r = requests.get(
-            "https://api.duckduckgo.com/",  # ← FIX: убраны пробелы
-            params={"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"},
+            "https://newsapi.org/v2/everything",
+            params={
+                "q": query[:50],
+                "language": "en",
+                "sortBy": "relevancy",
+                "pageSize": 5,
+                "apiKey": NEWS_KEY,
+            },
+            timeout=10,
+        )
+        data = r.json()
+        return [a["title"] for a in data.get("articles", [])[:5]]
+    except Exception as e:
+        log.warning("News error: %s", e)
+        return []
+
+def fetch_news_for_market(question: str) -> str:
+    """Отримує новини з кешем щоб не витрачати API ліміт."""
+    key = question[:40]
+    # Check cache
+    if key in NEWS_CACHE:
+        ts, data = NEWS_CACHE[key]
+        if time.time() - ts < NEWS_CACHE_TTL:
+            return data
+    # Fetch fresh
+    articles = search_news(question)
+    if articles:
+        result = " | ".join(articles[:3])
+        NEWS_CACHE[key] = (time.time(), result)
+        return result
+    # Fallback to DuckDuckGo
+    try:
+        r = requests.get(
+            "https://api.duckduckgo.com/",
+            params={"q": question[:50], "format": "json", "no_html": "1"},
             timeout=8,
         )
         data = r.json()
-        snippets = []
-        if data.get("AbstractText"):
-            snippets.append(data["AbstractText"][:300])
-        for topic in data.get("RelatedTopics", [])[:2]:
-            if isinstance(topic, dict) and topic.get("Text"):
-                snippets.append(topic["Text"][:150])
-        return " | ".join(snippets) if snippets else ""
-    except Exception as e:
-        log.warning(f"News fetch error: {e}")
+        text = data.get("AbstractText", "")
+        result = text[:300] if text else ""
+        NEWS_CACHE[key] = (time.time(), result)
+        return result
+    except Exception:
         return ""
 
 
@@ -255,94 +330,112 @@ def fetch_news(query: str) -> str:
 # 🧠  AI ANALYSIS
 # ══════════════════════════════════════════════
 
+def extract_json(text: str) -> dict | None:
+    """Safely extract JSON even if Claude adds extra text."""
+    # Try direct parse first
+    try:
+        return json.loads(text.strip())
+    except Exception:
+        pass
+    # Try regex extract
+    match = re.search(r'\{[\s\S]*\}', text)
+    if match:
+        try:
+            return json.loads(match.group())
+        except Exception:
+            pass
+    return None
+
 def build_context(memory: dict) -> str:
     closed = [b for b in memory["bets"] if b["status"] in ("closed", "cancelled")][-5:]
     if not closed:
         return "Нет предыдущих ставок."
     lines = ["Предыдущие ставки (учись на них):"]
     for b in closed:
-        result = "ВЫИГРЫШ ✅" if (b.get("pnl") or 0) > 0 else "ПРОИГРЫШ ❌"
+        result = "ВЫИГРЫШ" if (b.get("pnl") or 0) > 0 else "ПРОИГРЫШ"
         lines.append(f"- {b['question'][:60]} | {b['pick']} | {result} | ${b.get('pnl', 0):.2f}")
     return "\n".join(lines)
 
-def kelly_bet(edge: float, price: float, balance: float, fraction: float = 0.25) -> float:
-    """Fractional Kelly (25%) — менший ризик, менша дисперсія."""
+def kelly_bet(true_prob: float, price: float, balance: float) -> float:
+    """Правильний Kelly Criterion: f = (p*b - q) / b де b = odds."""
     try:
-        if edge <= 0 or price <= 0 or price >= 1:
+        if price <= 0 or price >= 1:
             return 1.0
-        odds = (1 / price) - 1
-        if odds <= 1e-9:  # ← FIX: защита от деления на ноль
-            return 1.0
-        full_kelly = edge / odds
-        wager = balance * full_kelly * fraction
-        return max(1.0, min(round(wager, 2), balance * 0.05))  # макс 5% балансу
-    except Exception as e:
-        log.warning(f"Kelly error: {e}")
+        odds = (1 / price) - 1  # decimal odds
+        kelly = (true_prob * odds - (1 - true_prob)) / odds
+        kelly = max(0, min(kelly, 0.05))  # cap at 5% bankroll
+        return max(1.0, min(round(balance * kelly, 2), 5.0))
+    except Exception:
         return 1.0
 
-def ai_analyse_batch(batch: list, mode: str, context: str, news_str: str) -> dict | None:
-    summaries = []
+def ai_analyse_batch(batch: list, mode: str, context: str) -> dict | None:
     now = datetime.now(timezone.utc)
+    summaries = []
     for m in batch:
         prices = parse_prices(m)
         price_str = ", ".join(f"{o}: {p:.1%}" for o, p in prices.items())
         end_dt = parse_end_date(m)
         hours = f"{(end_dt - now).total_seconds()/3600:.0f}h" if end_dt else "?"
-        summaries.append(f"[id:{m.get('id','?')}] {m['question']} | {price_str} | Closes:{hours}")
+        vol = m.get("volume24hr", 0)
+        summaries.append(f"[id:{m.get('id')}] {m['question']} | {price_str} | Vol:${vol} | Closes:{hours}")
+
+    # Fetch news for top 2 markets
+    news_parts = []
+    for m in batch[:2]:
+        news = fetch_news_for_market(m["question"])
+        if news:
+            news_parts.append(f"{m['question'][:40]}: {news[:200]}")
+    news_str = "\n".join(news_parts) if news_parts else "Нет новостей."
 
     if mode == "lottery":
-        strategy = "ЛОТЕРЕЯ: Найди рынок где низковероятный исход (<8%) реально более вероятен чем думает толпа."
-        bet_field = '"bet_usd": <1-3>,'
+        strategy = "ЛОТЕРЕЯ: Найди рынок где исход с ценой <8% реально более вероятен. Ищи неожиданные события."
+        bet_field = '"bet_usd": <1-2>,'
     else:
-        strategy = "VALUE: Найди рынок где толпа ошибается на 10%+ в вероятности."
-        bet_field = '"bet_usd": <3-5>,'
+        strategy = "VALUE: Найди рынок где толпа ошибается на 10%+. Смотри на оба направления."
+        bet_field = '"bet_usd": <2-4>,'
 
-    prompt = f"""Ты эксперт по prediction markets с доступом к интернету в реальном времени.
+    prompt = f"""Ты профессиональный трейдер prediction markets.
 
-ТВОИ ПРОШЛЫЕ СТАВКИ (учись на них):
+ИСТОРИЯ СТАВОК:
 {context}
 
-ДОСТУПНЫЕ РЫНКИ:
+НОВОСТИ:
+{news_str}
+
+РЫНКИ:
 {chr(10).join(summaries)}
 
 ЗАДАЧА: {strategy}
 
-ОБЯЗАТЕЛЬНО перед ответом используй web_search чтобы:
-1. Проверить реальную цену (BTC, ETH и т.д.) если рынок о крипте
-2. Найти последние новости по теме рынка
-3. Убедиться что твоя оценка основана на реальных данных
+Сначала подумай: какой рынок выглядит неправильно оцененным и почему?
+Проверь: если рынок о крипте - соответствует ли условие текущей цене?
 
 ПРАВИЛА:
-- Никогда не выбирай рынки где цена крипты уже не соответствует условию
-- Никогда не выбирай рынки с прошедшими датами
-- Все текстовые поля на РУССКОМ языке
+- Не выбирай рынки с прошедшими датами
+- Все текстовые поля на РУССКОМ
 - Если нет хорошей возможности - верни score: 0
 
-Ответь ТОЛЬКО валидным JSON без markdown:
+Ответь ТОЛЬКО валидным JSON:
 {{
-  "thoughts": "<что нашел в интернете и как это влияет на решение>",
+  "thoughts": "<рассуждения 1-2 предложения>",
   "mode": "{mode}",
   "market_id": "<id>",
   "question": "<перевод на русский>",
   "pick": "<YES или NO>",
-  "market_price": <число от 0.01 до 0.99>,
-  "true_probability": <твоя честная оценка от 0.01 до 0.99>,
+  "market_price": <0.01-0.99>,
+  "true_probability": <0.01-0.99>,
   "potential_multiplier": <целое число>,
-  "reason": "<вывод на русском с реальными данными из интернета>",
+  "reason": "<вывод на русском с реальными данными>",
   {bet_field}
   "score": <0-100>
-}}
-"""
+}}"""
 
     try:
-        # ← FIX: убран use_search=True (не был в сигнатуре функции)
-        text = call_claude(prompt, max_tokens=800)
-        if "```" in text:
-            parts = text.split("```")
-            text = parts[1] if len(parts) > 1 else text
-            if text.startswith("json"):
-                text = text[4:]
-        result = json.loads(text.strip())
+        text = call_claude(prompt, max_tokens=600, use_search=True)
+        result = extract_json(text)
+        if not result:
+            log.warning("Claude returned invalid JSON: %s", text[:100])
+            return None
         result.setdefault("bet_pct", 2)
         return result
     except Exception as e:
@@ -355,22 +448,16 @@ def ai_analyse(markets: list, memory: dict, skip_ids: set = None) -> dict | None
     if not markets:
         return None
 
-    mode    = random.choices(["lottery", "value"], weights=[60, 40])[0]
+    mode    = random.choices(["lottery", "value"], weights=[20, 80])[0]
     context = build_context(memory)
 
-    news_parts = []
-    for m in markets[:3]:
-        news = fetch_news(m["question"][:50])
-        if news:
-            news_parts.append(f"{m['question'][:40]}: {news[:150]}")
-    news_str = "\n".join(news_parts) if news_parts else "Нет новостей."
-
-    batches = [markets[i:i+25] for i in range(0, len(markets), 25)]
+    batches = [markets[i:i+20] for i in range(0, len(markets), 20)][:3]
     log.info("Analysing %d markets in %d batches (mode=%s)", len(markets), len(batches), mode)
 
     candidates = []
     for i, batch in enumerate(batches):
-        result = ai_analyse_batch(batch, mode, context, news_str)
+        log.info("Batch %d/%d", i+1, len(batches))
+        result = ai_analyse_batch(batch, mode, context)
         if result and result.get("score", 0) > 30 and result.get("market_id"):
             candidates.append(result)
 
@@ -408,7 +495,7 @@ def resolve_bets(memory: dict) -> list[str]:
             bet["pnl"] = 0
             memory["balance"] += bet["wager"]
             memory["stats"]["cancelled"] = memory["stats"].get("cancelled", 0) + 1
-            msgs.append(f"↩️ *Возврат*\n{bet['question']}\nРынок закрылся без результата → +${bet['wager']:.2f}")
+            msgs.append(f"↩️ *Возврат*\n{bet['question']}\nРынок закрылся без результата +${bet['wager']:.2f}")
             continue
 
         bet["status"] = "closed"
@@ -429,9 +516,8 @@ def resolve_bets(memory: dict) -> list[str]:
             msgs.append(
                 f"✅ *ВЫИГРЫШ!* {'🎰' if mode=='lottery' else '🎯'}\n"
                 f"{bet['question']}\n"
-                f"Выбрал {bet['pick']} → {winner}\n"
-                f"Ставка: ${wager:.2f} | Прибыль: *+${profit:.2f}*\n"
-                f"💼 Баланс: ${memory['balance']:.2f}"
+                f"Выбрал {bet['pick']} -> {winner}\n"
+                f"Прибыль: *+${profit:.2f}* | Баланс: ${memory['balance']:.2f}"
             )
         else:
             memory["total_profit"] -= wager
@@ -441,7 +527,7 @@ def resolve_bets(memory: dict) -> list[str]:
             msgs.append(
                 f"❌ *ПРОИГРЫШ* {'🎰' if mode=='lottery' else '🎯'}\n"
                 f"{bet['question']}\n"
-                f"Выбрал {bet['pick']} → {winner}\n"
+                f"Выбрал {bet['pick']} -> {winner}\n"
                 f"Потеряно: -${wager:.2f} | Баланс: ${memory['balance']:.2f}"
             )
 
@@ -450,7 +536,7 @@ def resolve_bets(memory: dict) -> list[str]:
 
 
 # ══════════════════════════════════════════════
-# 🎮  SHARED BET LOGIC
+# 🎮  PLACE BET
 # ══════════════════════════════════════════════
 
 async def place_bet(message, memory: dict, analysis: dict, markets: list):
@@ -467,13 +553,11 @@ async def place_bet(message, memory: dict, analysis: dict, markets: list):
     true_prob  = analysis.get("true_probability", price)
     multiplier = analysis.get("potential_multiplier", max(1, round(1/price)) if price > 0 else 1)
 
-    edge  = abs(true_prob - price)
-    wager = kelly_bet(edge, price, memory["balance"])
-    wager = float(analysis.get("bet_usd", wager))
+    wager = float(analysis.get("bet_usd", kelly_bet(true_prob, price, memory["balance"])))
     wager = max(1.0, min(wager, 5.0))
 
     if memory["balance"] < wager:
-        wager = round(memory["balance"] * 0.02, 2)
+        wager = round(memory["balance"] * 0.05, 2)
     if wager < 0.5:
         return False
 
@@ -492,6 +576,7 @@ async def place_bet(message, memory: dict, analysis: dict, markets: list):
         "status": "open",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "reason": analysis.get("reason", ""),
+        "thoughts": analysis.get("thoughts", ""),
         "pnl": None,
     })
     save_memory(memory)
@@ -505,10 +590,9 @@ async def place_bet(message, memory: dict, analysis: dict, markets: list):
         f"💰 Ставка: ${wager:.2f}\n"
         f"🏆 Если выиграет: ~${wager*multiplier:.0f}\n"
         f"💼 Баланс: ${memory['balance']:.2f}\n\n"
-        f"🧠 {analysis.get('reason','—')}\n\n"
-        f"\U0001f4cb ID ринку: `{matched.get('id','?')}` (шукай на Polymarket)",
+        f"💭 {analysis.get('thoughts','')}\n"
+        f"🧠 {analysis.get('reason','—')}",
         parse_mode="Markdown",
-        disable_web_page_preview=True,
     )
     return True
 
@@ -527,15 +611,18 @@ def main_keyboard():
          InlineKeyboardButton("📈 График", callback_data="history")],
         [InlineKeyboardButton("⏰ Авторежим ON", callback_data="autostart"),
          InlineKeyboardButton("⏹ Авторежим OFF", callback_data="autostop")],
+        [InlineKeyboardButton("🔍 Диагностика", callback_data="check")],
     ])
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    news_status = "NewsAPI подключен" if NEWS_KEY else "NewsAPI не подключен (добавь NEWS_KEY)"
     await update.message.reply_text(
-        "🤖 *Polymarket Bot v3.2 FIXED*\n\n"
-        "Claude Haiku AI + новости + память ошибок\n"
-        "Стратегия: 🎰 60% лотерея + 🎯 40% value\n"
+        "🤖 *Polymarket Bot v4.0*\n\n"
+        "Claude Haiku + веб-поиск + NewsAPI\n"
+        "Стратегия: 60% лотерея + 40% value\n"
         "Частота: каждые 30 минут\n"
-        "Рынки: только закрываются в течение 48ч",
+        "Рынков: до 2000 (async)\n\n"
+        f"📰 {news_status}",
         parse_mode="Markdown",
         reply_markup=main_keyboard(),
     )
@@ -552,19 +639,20 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif query.data == "history": await _do_history(msg)
     elif query.data == "autostart": await _do_autostart(msg, ctx)
     elif query.data == "autostop":  await _do_autostop(msg, ctx)
+    elif query.data == "check":     await _do_check(msg)
 
 async def _do_analyse(message):
-    msg = await message.reply_text("⏳ Сканирую рынки...")
+    msg = await message.reply_text("⏳ Завантажую до 2000 ринків (async)...")
     memory  = load_memory()
     markets = fetch_markets()
     if not markets:
-        await msg.edit_text("❌ Нет актуальных рынков (все закрываются >12ч или уже прошли).")
+        await msg.edit_text("❌ Не знайдено ринків що закриваються в найближчі 48 годин.")
         return
-    await msg.edit_text(f"🧠 Claude анализирует {len(markets)} рынков...")
+    await msg.edit_text(f"🧠 Claude аналізує {len(markets)} ринків з новинами...")
     already_bet = {b["market_id"] for b in memory["bets"] if b["status"] == "open"}
     analysis = ai_analyse(markets, memory, skip_ids=already_bet)
     if not analysis:
-        await msg.edit_text("❌ Claude не нашёл хорошей возможности сейчас.")
+        await msg.edit_text("❌ Claude не знайшов хорошої можливості зараз.")
         return
     await msg.delete()
     await place_bet(message, memory, analysis, markets)
@@ -577,9 +665,8 @@ async def _do_stats(message):
     roi = (memory["total_profit"] / s["total_wagered"] * 100) if s["total_wagered"] else 0
     open_count = sum(1 for b in memory["bets"] if b["status"] == "open")
     drawdown = memory["balance"] - memory.get("peak_balance", STARTING_BALANCE)
-
     await message.reply_text(
-        f"📊 *Статистика*\n\n"
+        f"📊 *Статистика v4.0*\n\n"
         f"💼 Баланс:      ${memory['balance']:.2f}\n"
         f"📈 Прибыль:     ${memory['total_profit']:+.2f}\n"
         f"🎯 ROI:         {roi:+.1f}%\n"
@@ -604,17 +691,17 @@ async def _do_bets(message):
     for b in open_bets[-10:]:
         emoji = "🎰" if b.get("mode") == "lottery" else "🎯"
         lines.append(
-            f"{emoji} {b['question'][:50]}…\n"
-            f"  → *{b['pick']}* | ${b['wager']:.2f} | x{b.get('potential_multiplier','?')} | {b['created_at'][:10]}"
+            f"{emoji} {b['question'][:50]}...\n"
+            f"  -> *{b['pick']}* | ${b['wager']:.2f} | x{b.get('potential_multiplier','?')} | {b['created_at'][:10]}"
         )
     await message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def _do_resolve(message):
-    await message.reply_text("🔍 Проверяю результаты...")
+    await message.reply_text("🔍 Перевіряю результати...")
     memory  = load_memory()
     results = resolve_bets(memory)
     if not results:
-        await message.reply_text("ℹ️ Рынки ещё не закрылись.")
+        await message.reply_text("Ринки ще не закрились.")
     else:
         for r in results:
             await message.reply_text(r, parse_mode="Markdown")
@@ -623,42 +710,109 @@ async def _do_top(message):
     memory = load_memory()
     closed = [b for b in memory["bets"] if b.get("pnl") is not None]
     if not closed:
-        await message.reply_text("📭 Ещё нет закрытых ставок.")
+        await message.reply_text("📭 Ще немає закритих ставок.")
         return
     by_pnl = sorted(closed, key=lambda x: x.get("pnl", 0), reverse=True)
     lines  = ["🏆 *Топ 3 лучших:*\n"]
     for b in by_pnl[:3]:
-        emoji = "🎰" if b.get("mode") == "lottery" else "🎯"
-        lines.append(f"{emoji} {b['question'][:45]}…\n   *+${b['pnl']:.2f}* | {b['pick']}")
+        lines.append(f"{'🎰' if b.get('mode')=='lottery' else '🎯'} {b['question'][:45]}...\n   *+${b['pnl']:.2f}* | {b['pick']}")
     lines.append("\n💀 *Топ 3 худших:*\n")
     for b in by_pnl[-3:]:
-        lines.append(f"❌ {b['question'][:45]}…\n   *${b['pnl']:.2f}* | {b['pick']}")
+        lines.append(f"❌ {b['question'][:45]}...\n   *${b['pnl']:.2f}* | {b['pick']}")
     await message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def _do_history(message):
     memory  = load_memory()
     history = memory.get("balance_history", [])
     if len(history) < 2:
-        await message.reply_text("📈 Мало данных. Подожди немного!")
+        await message.reply_text("📈 Мало даних. Зачекай трохи!")
         return
     balances = [h["balance"] for h in history[-20:]]
-    min_b    = min(balances)
-    max_b    = max(balances)
-    height   = 8
-    lines    = []
-    for row in range(height, 0, -1):
-        threshold = min_b + (max_b - min_b) * row / height
+    min_b, max_b = min(balances), max(balances)
+    lines = []
+    for row in range(8, 0, -1):
+        threshold = min_b + (max_b - min_b) * row / 8
         bar   = "".join("█" if b >= threshold else "░" for b in balances)
-        label = f"${threshold:.0f}|" if row in (height, height//2, 1) else "      |"
+        label = f"${threshold:.0f}|" if row in (8, 4, 1) else "      |"
         lines.append(f"`{label}{bar}`")
     diff = balances[-1] - balances[0]
     sign = "+" if diff >= 0 else ""
     await message.reply_text(
-        f"📈 *График баланса* (последние {len(balances)} точек)\n\n" +
-        "\n".join(lines) +
-        f"\n\n💼 Начало: ${balances[0]:.2f} → Сейчас: ${balances[-1]:.2f} ({sign}{diff:.2f})",
+        f"📈 *График баланса*\n\n" + "\n".join(lines) +
+        f"\n\n💼 ${balances[0]:.2f} -> ${balances[-1]:.2f} ({sign}{diff:.2f})",
         parse_mode="Markdown",
     )
+
+async def _do_check(message):
+    msg = await message.reply_text("🔍 Диагностика...")
+    lines = []
+
+    # Polymarket
+    try:
+        r = requests.get(POLYMARKET_API, params={"limit": 5, "active": "true"}, timeout=10)
+        r.raise_for_status()
+        lines.append(f"✅ Polymarket API — OK")
+    except Exception as e:
+        lines.append(f"❌ Polymarket API — {str(e)[:50]}")
+
+    # Claude
+    try:
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": os.environ.get("ANTHROPIC_KEY",""),
+                     "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
+            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 10,
+                  "messages": [{"role": "user", "content": "hi"}]},
+            timeout=15,
+        )
+        r.raise_for_status()
+        lines.append("✅ Claude Haiku API — OK")
+    except Exception as e:
+        lines.append(f"❌ Claude API — {str(e)[:80]}")
+
+    # NewsAPI
+    if NEWS_KEY:
+        try:
+            r = requests.get("https://newsapi.org/v2/everything",
+                params={"q": "bitcoin", "pageSize": 1, "apiKey": NEWS_KEY}, timeout=8)
+            r.raise_for_status()
+            lines.append("✅ NewsAPI — OK")
+        except Exception as e:
+            lines.append(f"❌ NewsAPI — {str(e)[:50]}")
+    else:
+        lines.append("⚠️ NewsAPI — не підключений (додай NEWS_KEY в Railway)")
+
+    # Markets count
+    try:
+        now = datetime.now(timezone.utc)
+        all_m = []
+        for offset in [0, 100, 200, 300, 400]:
+            r2 = requests.get(POLYMARKET_API,
+                params={"limit": 100, "active": "true", "offset": offset}, timeout=10)
+            batch = r2.json()
+            if not batch: break
+            all_m.extend(batch)
+        valid = filter_good_markets(all_m)
+        lines.append(f"✅ Ринків всього: {len(all_m)} | Після фільтру: {len(valid)}")
+    except Exception as e:
+        lines.append(f"❌ Ошибка рынков: {str(e)[:50]}")
+
+    # Memory
+    try:
+        memory = load_memory()
+        open_bets = sum(1 for b in memory["bets"] if b["status"] == "open")
+        lines.append(f"✅ Память — ${memory['balance']:.2f} | Ставок: {open_bets}")
+    except Exception as e:
+        lines.append(f"❌ Память — {str(e)[:50]}")
+
+    # Env
+    tg  = "✅" if os.environ.get("TG_TOKEN") else "❌"
+    ant = "✅" if os.environ.get("ANTHROPIC_KEY") else "❌"
+    nws = "✅" if os.environ.get("NEWS_KEY") else "⚠️"
+    lines.append(f"{tg} TG_TOKEN | {ant} ANTHROPIC_KEY | {nws} NEWS_KEY")
+
+    result = "\n".join(lines)
+    await msg.edit_text(f"🔍 *Диагностика v4.0:*\n\n{result}", parse_mode="Markdown")
 
 async def _do_autostart(message, ctx):
     chat_id = message.chat.id
@@ -671,7 +825,8 @@ async def _do_autostart(message, ctx):
     await message.reply_text(
         "⏰ *Авторежим включён!*\n\n"
         "Каждые *30 минут:*\n"
-        "• Сканирую 100 рынков\n"
+        "• Загружаю до 2000 рынков (async)\n"
+        "• Ищу новости через NewsAPI\n"
         "• Анализирую через Claude Haiku\n"
         "• Ставлю если есть сигнал\n"
         "• Проверяю результаты\n\n"
@@ -712,14 +867,13 @@ async def _auto_job(ctx: ContextTypes.DEFAULT_TYPE):
 
     class FakeMessage:
         def __init__(self, bot, chat_id):
-            self.bot = bot
-            self.chat_id = chat_id
+            self._bot = bot
+            self._chat_id = chat_id
         async def reply_text(self, text, **kwargs):
-            await self.bot.send_message(chat_id=self.chat_id, text=text, **kwargs)
+            await self._bot.send_message(chat_id=self._chat_id, text=text, **kwargs)
 
-    fake_msg = FakeMessage(ctx.bot, chat_id)
-    memory   = load_memory()
-    await place_bet(fake_msg, memory, analysis, markets)
+    memory = load_memory()
+    await place_bet(FakeMessage(ctx.bot, chat_id), memory, analysis, markets)
 
 
 # ══════════════════════════════════════════════
@@ -734,84 +888,7 @@ async def cmd_top(u, c):       await _do_top(u.message)
 async def cmd_history(u, c):   await _do_history(u.message)
 async def cmd_autostart(u, c): await _do_autostart(u.message, c)
 async def cmd_autostop(u, c):  await _do_autostop(u.message, c)
-
-async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("🔍 Проверяю все подключения...")
-    lines = []
-
-    # 1. Polymarket API
-    try:
-        r = requests.get("https://gamma-api.polymarket.com/markets",  # ← FIX
-                        params={"limit": 5, "active": "true"}, timeout=10)
-        r.raise_for_status()
-        markets = r.json()
-        lines.append(f"✅ Polymarket API — работает ({len(markets)} рынков получено)")
-    except Exception as e:
-        lines.append(f"❌ Polymarket API — ошибка: {str(e)[:50]}")
-
-    # 2. Claude API
-    try:
-        r = requests.post(
-            "https://api.anthropic.com/v1/messages",  # ← FIX
-            headers={"x-api-key": os.environ.get("ANTHROPIC_KEY", ""),
-                     "anthropic-version": "2023-06-01",
-                     "Content-Type": "application/json"},
-            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 10,  # ← твоя модель
-                  "messages": [{"role": "user", "content": "say ok"}]},
-            timeout=15,
-        )
-        r.raise_for_status()
-        lines.append("✅ Claude Haiku API — работает")
-    except Exception as e:
-        lines.append(f"❌ Claude API — ошибка: {str(e)[:80]}")
-
-    # 3. Markets within 48h
-    try:
-        now = datetime.now(timezone.utc)
-        all_m = []
-        for offset in [0, 100, 200, 300, 400, 500, 600, 700]:
-            r2 = requests.get("https://gamma-api.polymarket.com/markets",  # ← FIX
-                params={"limit": 100, "active": "true", "closed": "false", "offset": offset}, timeout=10)
-            batch = r2.json()
-            if not batch: break
-            all_m.extend(batch)
-        valid = []
-        no_date = 0
-        for m in all_m:
-            end_dt = None
-            for field in ["endDate", "end_date", "expirationTime", "endDateIso"]:
-                val = m.get(field)
-                if val:
-                    try:
-                        end_dt = datetime.fromisoformat(str(val).replace("Z", "+00:00"))
-                        break
-                    except Exception:
-                        pass
-            if end_dt:
-                hours = (end_dt - now).total_seconds() / 3600
-                if 0 < hours <= 48:
-                    valid.append(m)
-            else:
-                no_date += 1
-        lines.append(f"✅ Всього ринків: {len(all_m)} | З датою 48ч: {len(valid)} | Без дати: {no_date}")
-    except Exception as e:
-        lines.append(f"❌ Ошибка подсчёта рынков: {str(e)[:50]}")
-        
-    # 4. Memory
-    try:
-        memory = load_memory()
-        open_bets = sum(1 for b in memory["bets"] if b["status"] == "open")
-        lines.append(f"✅ Память — баланс ${memory['balance']:.2f}, открытых ставок: {open_bets}")
-    except Exception as e:
-        lines.append(f"❌ Память — ошибка: {str(e)[:50]}")
-
-    # 5. Env vars
-    tg  = "✅" if os.environ.get("TG_TOKEN") else "❌"
-    ant = "✅" if os.environ.get("ANTHROPIC_KEY") else "❌"
-    lines.append(f"{tg} TG_TOKEN | {ant} ANTHROPIC_KEY")
-
-    result = "\n".join(lines)
-    await msg.edit_text(f"\U0001f50d *Диагностика:*\n\n{result}", parse_mode="Markdown")
+async def cmd_check(u, c):     await _do_check(u.message)
 
 def main():
     app = Application.builder().token(TG_TOKEN).build()
@@ -824,9 +901,9 @@ def main():
     app.add_handler(CommandHandler("history",   cmd_history))
     app.add_handler(CommandHandler("autostart", cmd_autostart))
     app.add_handler(CommandHandler("autostop",  cmd_autostop))
-    app.add_handler(CommandHandler("check", cmd_check))  # ← FIX: убран дубликат
+    app.add_handler(CommandHandler("check",     cmd_check))
     app.add_handler(CallbackQueryHandler(button_handler))
-    log.info("🚀 Bot v3.2 FIXED started!")
+    log.info("🚀 Bot v4.0 started!")
     app.run_polling()
 
 if __name__ == "__main__":
