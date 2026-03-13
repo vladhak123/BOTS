@@ -133,25 +133,23 @@ def parse_prices(market: dict) -> dict:
     except Exception:
         return {}
 
-async def fetch_markets_async() -> list[dict]:
-    """Завантажує до 2000 ринків паралельно через httpx."""
+def fetch_markets_raw() -> list[dict]:
+    """Завантажує до 2000 ринків через sync requests."""
     all_markets = []
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        tasks = [
-            client.get(POLYMARKET_API, params={"limit": 100, "offset": page * 100, "active": "true"})
-            for page in range(20)  # 20 pages x 100 = 2000 markets
-        ]
-        responses = await asyncio.gather(*tasks, return_exceptions=True)
-        for r in responses:
-            try:
-                if isinstance(r, Exception):
-                    continue
-                batch = r.json()
-                if batch:
-                    all_markets.extend(batch)
-            except Exception:
-                pass
-
+    for page in range(20):
+        try:
+            r = requests.get(
+                POLYMARKET_API,
+                params={"limit": 100, "offset": page * 100, "active": "true"},
+                timeout=15,
+            )
+            batch = r.json()
+            if not batch:
+                break
+            all_markets.extend(batch)
+        except Exception as e:
+            log.warning("Page %d error: %s", page, e)
+            break
     log.info("Loaded %d markets total", len(all_markets))
     return all_markets
 
@@ -179,26 +177,11 @@ def filter_good_markets(markets: list[dict]) -> list[dict]:
         if is_question_expired(question):
             continue
 
-        # Skip if question mentions a future date >2 days away
-        skip = False
-        for mon, day in re.findall(r'(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[ ]+([0-9]{1,2})', question.lower()):
-            try:
-                mn = MONTHS.get(mon[:3], 0)
-                if mn:
-                    candidate = date(now.year, mn, int(day))
-                    if (candidate - now.date()).days > 2:
-                        skip = True
-                        break
-            except Exception:
-                pass
-        if skip:
-            continue
-
-        # Check end date
+        # Check end date - only filter if date exists and already expired
         end_dt = parse_end_date(m)
         if end_dt:
             hours_left = (end_dt - now).total_seconds() / 3600
-            if hours_left < 0 or hours_left > 48:
+            if hours_left < 0:
                 continue
 
         # Price filter: skip if all prices are extreme (>95% or <1%)
@@ -236,17 +219,12 @@ def filter_good_markets(markets: list[dict]) -> list[dict]:
     return valid
 
 def fetch_markets() -> list[dict]:
-    """Синхронна обгортка для async з кешем 10 хв."""
+    """Завантажує ринки з кешем 10 хв."""
     global MARKETS_CACHE, MARKETS_TS
     if MARKETS_CACHE is not None and time.time() - MARKETS_TS < MARKETS_CACHE_TTL:
         log.info("Using cached markets (%d)", len(MARKETS_CACHE))
         return MARKETS_CACHE
-    try:
-        all_markets = asyncio.run(fetch_markets_async())
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        all_markets = loop.run_until_complete(fetch_markets_async())
+    all_markets = fetch_markets_raw()
 
     valid = filter_good_markets(all_markets)
     random.shuffle(valid)
